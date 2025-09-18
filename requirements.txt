@@ -1,0 +1,19 @@
+# Core framework
+streamlit==1.37.0
+
+# Data handling
+pandas==2.2.2
+openpyxl==3.1.5
+xlsxwriter==3.2.0
+
+# PDF handling
+PyPDF2==3.0.1
+pikepdf==9.2.1
+
+# OCR (optional, only if you want result extraction from scanned PDFs)
+pdf2image==1.17.0
+pytesseract==0.3.13
+Pillow==10.4.0
+
+# Extra utilities
+requests==2.32.3
