@@ -1,145 +1,206 @@
 # streamlit_app.py
 """
-Aiclex — Hall Ticket Mailer (Auto-fill recipients fixed)
-- Upload Excel + ZIP of PDFs
-- Map columns: Hallticket, Candidate Email, Location
-- Choose recipient source: coordinator column / specific column / aggregate candidate emails
-- Email extraction via regex (handles names+emails, multiple emails)
-- Auto-populates per-location recipient fields when a recipient source is selected
-- Create location-wise chunked ZIPs, send via SMTP with subject/body/footer templates
-- Test mode and per-candidate sends supported
+Aiclex Hallticket Mailer — Final
+Features:
+- Login guard
+- Upload Excel + nested ZIPs
+- Filename-last-digit hallticket matching
+- Group by Location, create one ZIP per location
+- Per-location recipients from Excel (editable)
+- Test mode, templates, progress UI, logs, mapping CSV download
 """
-import streamlit as st
-import pandas as pd
-import zipfile, os, io, tempfile, shutil, time, re
-from collections import defaultdict, Counter
-from datetime import datetime
+import os
+import io
+import re
+import time
+import zipfile
+import tempfile
+import shutil
 import smtplib
 from email.message import EmailMessage
+from collections import defaultdict, Counter
+from datetime import datetime
+
+import streamlit as st
+import pandas as pd
+
+# ---------------- Config ----------------
+st.set_page_config(page_title="Aiclex Mailer (Final)", layout="wide")
+st.title("📧 Aiclex Hallticket Mailer — Final")
+
+# ---------------- Simple Login Guard ----------------
+DEFAULT_USER = "info@aiclex.in"
+DEFAULT_PASS = "Aiclex@2025"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+def login_block():
+    if st.session_state.authenticated:
+        cols = st.columns([1, 7, 2])
+        with cols[2]:
+            if st.button("Logout"):
+                st.session_state.authenticated = False
+                st.rerun()
+        return True
+    st.markdown("### Login required")
+    with st.form("login_form"):
+        user = st.text_input("Email", value=DEFAULT_USER)
+        pwd = st.text_input("Password", type="password", value=DEFAULT_PASS)
+        submitted = st.form_submit_button("Login")
+    if submitted:
+        if user == DEFAULT_USER and pwd == DEFAULT_PASS:
+            st.session_state.authenticated = True
+            st.success("Login successful")
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
+    return False
+
+if not login_block():
+    st.stop()
 
 # ---------------- Helpers ----------------
-EMAIL_REGEX = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', re.UNICODE)
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 def human_bytes(n):
     try:
         n = float(n)
     except:
         return ""
-    for unit in ['B','KB','MB','GB','TB']:
+    for unit in ["B","KB","MB","GB","TB"]:
         if n < 1024:
             return f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} TB"
 
-def looks_like_email(s):
-    return bool(EMAIL_REGEX.findall(str(s))) if s else False
+def extract_zip_bytes_recursively(zip_bytes, out_root):
+    """
+    Extract zip bytes recursively (handles nested zips).
+    Returns list of absolute PDF paths extracted.
+    """
+    extracted_pdfs = []
+    # unique folder for this extraction
+    base_dir = tempfile.mkdtemp(prefix="aiclex_unzip_", dir=out_root)
 
-def extract_emails_from_text(s):
-    if not s:
-        return []
-    return EMAIL_REGEX.findall(str(s))
-
-def extract_zip_recursively(zip_file_like, extract_to):
-    with zipfile.ZipFile(zip_file_like) as z:
-        z.extractall(path=extract_to)
-    for root, _, files in os.walk(extract_to):
-        for f in files:
-            if f.lower().endswith('.zip'):
-                nested = os.path.join(root, f)
-                nested_dir = os.path.join(root, f"_nested_{f}")
+    def _process_zip(zf, curdir):
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            lname = name.lower()
+            try:
+                data = zf.read(info)
+            except Exception:
+                continue
+            if lname.endswith(".zip"):
+                # nested zip: create nested dir and recurse
+                nested_dir = os.path.join(curdir, os.path.splitext(os.path.basename(name))[0])
                 os.makedirs(nested_dir, exist_ok=True)
-                with open(nested, 'rb') as nf:
-                    extract_zip_recursively(nf, nested_dir)
+                try:
+                    with zipfile.ZipFile(io.BytesIO(data)) as nz:
+                        _process_zip(nz, nested_dir)
+                except Exception:
+                    # fallback: write to disk then open
+                    try:
+                        tmpf = os.path.join(nested_dir, os.path.basename(name))
+                        with open(tmpf, "wb") as wf:
+                            wf.write(data)
+                        with zipfile.ZipFile(tmpf) as nz:
+                            _process_zip(nz, os.path.splitext(tmpf)[0])
+                    except Exception:
+                        continue
+            elif lname.endswith(".pdf"):
+                # write pdf out
+                os.makedirs(curdir, exist_ok=True)
+                target = os.path.join(curdir, os.path.basename(name))
+                # avoid overwrite collisions
+                if os.path.exists(target):
+                    base, ext = os.path.splitext(os.path.basename(name))
+                    target = os.path.join(curdir, f"{base}_{int(time.time()*1000)}{ext}")
+                try:
+                    with open(target, "wb") as outf:
+                        outf.write(data)
+                    extracted_pdfs.append(os.path.abspath(target))
+                except Exception:
+                    continue
+            else:
+                # ignore other file types
+                continue
 
-def create_chunked_zips(file_paths, out_dir, base_name, max_bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        _process_zip(z, base_dir)
+
+    return extracted_pdfs
+
+def extract_hallticket_from_filename(path):
+    """
+    Extract last digit sequence from filename.
+    e.g. 1036_17_802871022.pdf -> 802871022
+    """
+    base = os.path.splitext(os.path.basename(path))[0]
+    digits = re.findall(r"\d+", base)
+    return digits[-1] if digits else None
+
+def create_zip_single(files, out_dir, base_name):
     os.makedirs(out_dir, exist_ok=True)
-    parts = []
-    current_files = []
-    part_index = 1
-    for fp in file_paths:
-        current_files.append(fp)
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-            for f in current_files:
-                z.write(f, arcname=os.path.basename(f))
-        size = buf.getbuffer().nbytes
-        if size <= max_bytes:
-            continue
-        else:
-            last = current_files.pop()
-            if current_files:
-                part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
-                with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-                    for f in current_files:
-                        z.write(f, arcname=os.path.basename(f))
-                parts.append({"path": part_path, "num_files": len(current_files), "size": os.path.getsize(part_path)})
-                part_index += 1
-            current_files = [last]
-    if current_files:
-        part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
-        with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-            for f in current_files:
-                z.write(f, arcname=os.path.basename(f))
-        parts.append({"path": part_path, "num_files": len(current_files), "size": os.path.getsize(part_path)})
-    return parts
+    safe = re.sub(r"[^A-Za-z0-9_\-]+", "_", base_name)[:100]
+    zpath = os.path.join(out_dir, f"{safe}.zip")
+    with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            z.write(f, arcname=os.path.basename(f))
+    return zpath
 
-def send_email(smtp_cfg, to_email, subject, body, attachment_path=None, attachment_name=None):
+def send_email_smtp(smtp_cfg, to_addr, subject, body, attachment_paths):
     msg = EmailMessage()
-    msg['From'] = smtp_cfg['sender']
-    msg['To'] = to_email
-    msg['Subject'] = subject
+    msg["From"] = smtp_cfg["sender"]
+    msg["To"] = to_addr
+    msg["Subject"] = subject
     msg.set_content(body)
-    if attachment_path:
-        with open(attachment_path, 'rb') as f:
-            data = f.read()
-        maintype = 'application'
-        subtype = 'zip' if (attachment_name or "").lower().endswith('.zip') else 'octet-stream'
-        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=attachment_name or os.path.basename(attachment_path))
-    if smtp_cfg.get('use_ssl', True):
-        server = smtplib.SMTP_SSL(smtp_cfg['host'], smtp_cfg['port'], timeout=60)
+    for ap in attachment_paths:
+        with open(ap, "rb") as af:
+            data = af.read()
+        msg.add_attachment(data, maintype="application", subtype="zip", filename=os.path.basename(ap))
+    if smtp_cfg.get("use_ssl", True):
+        server = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=60)
     else:
-        server = smtplib.SMTP(smtp_cfg['host'], smtp_cfg['port'], timeout=60)
+        server = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=60)
         server.starttls()
-    if smtp_cfg.get('password'):
-        server.login(smtp_cfg['sender'], smtp_cfg['password'])
+    if smtp_cfg.get("password"):
+        server.login(smtp_cfg["sender"], smtp_cfg["password"])
     server.send_message(msg)
     server.quit()
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="Aiclex Mailer", layout="wide")
-st.title("📧 Aiclex Technologies — Hall Ticket Mailer (Auto-fill)")
-
-# Sidebar
+# ---------------- Sidebar / Settings ----------------
 with st.sidebar:
-    st.header("SMTP Settings")
+    st.header("SMTP & Templates")
     smtp_host = st.text_input("SMTP host", value="smtp.hostinger.com")
     smtp_port = st.number_input("SMTP port", value=465)
-    protocol = st.selectbox("Protocol", ["SMTPS (SSL)", "SMTP (STARTTLS)"], index=0)
-    sender_email = st.text_input("Sender email", value="info@aiclex.in")
-    sender_password = st.text_input("Sender password", type="password")
-    st.markdown("---")
-    st.header("Email Templates")
-    subject_template = st.text_input("Subject template (use {location})", value="Hall Tickets — {location}")
-    body_template = st.text_area("Body template (use {location} and {footer})", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\n{footer}", height=160)
-    footer_text = st.text_area("Footer text", value="Regards,\nAiclex Technologies\ninfo@aiclex.in", height=80)
-    st.markdown("---")
-    st.header("Options")
-    delay_seconds = st.number_input("Delay between emails (s)", value=2.0, step=0.5)
-    attachment_limit_mb = st.number_input("Attachment limit (MB)", value=3.0, step=0.5)
-    test_mode = st.checkbox("Test mode (send all to test address)", value=True)
-    test_email = st.text_input("Test recipient email", value="info@aiclex.in")
-    send_candidates = st.checkbox("Also send per-candidate emails", value=False)
+    smtp_use_ssl = st.checkbox("Use SSL (SMTPS)", value=True)
+    smtp_sender = st.text_input("Sender email", value="info@aiclex.in")
+    smtp_password = st.text_input("Sender password", type="password", value="")
 
-# 1) Upload
-st.header("1) Upload Excel and ZIP")
-uploaded_excel = st.file_uploader("Upload Excel (.xlsx/.csv) with Hallticket, Email, Location columns", type=["xlsx","csv"])
-uploaded_zip = st.file_uploader("Upload master ZIP of PDFs (nested zips allowed)", type=["zip"])
+    st.markdown("---")
+    st.subheader("Email content")
+    subject_template = st.text_input("Subject (use {location})", value="Hall Tickets — {location}")
+    body_template = st.text_area("Body (use {location} and {footer})", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\n{footer}", height=140)
+    footer_text = st.text_input("Footer", value="Regards,\nAiclex Technologies\ninfo@aiclex.in")
 
+    st.markdown("---")
+    st.subheader("Options")
+    delay_seconds = st.number_input("Delay between sends (seconds)", value=2.0, step=0.5)
+    test_mode = st.checkbox("Enable Test Mode (send all mails to Test Email)", value=True)
+    test_email = st.text_input("Test Email (used when Test Mode ON)", value="info@aiclex.in")
+
+# ---------------- File Upload ----------------
+st.header("1) Upload Excel & Master ZIP")
+uploaded_excel = st.file_uploader("Upload Excel (.xlsx or .csv) with Hallticket, Recipient Email, Location columns", type=["xlsx","csv"])
+uploaded_zip = st.file_uploader("Upload Master ZIP (PDFs; nested zips allowed)", type=["zip"])
 if not uploaded_excel or not uploaded_zip:
-    st.info("Please upload both Excel and ZIP to proceed.")
+    st.info("Upload both Excel and ZIP to continue.")
     st.stop()
 
-# Read excel
+# ---------------- Read Excel ----------------
 try:
     if uploaded_excel.name.lower().endswith(".csv"):
         df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
@@ -149,308 +210,263 @@ except Exception as e:
     st.error("Failed to read Excel: " + str(e))
     st.stop()
 
-# Extract zip
-tmp_zip_dir = tempfile.mkdtemp(prefix="aiclex_zip_")
-try:
-    bio = io.BytesIO(uploaded_zip.read())
-    extract_zip_recursively(bio, tmp_zip_dir)
-except Exception as e:
-    st.error("Failed to extract ZIP: " + str(e))
-    st.stop()
-
-# pdf map
-pdf_map = {}
-for root, _, files in os.walk(tmp_zip_dir):
-    for f in files:
-        if f.lower().endswith(".pdf"):
-            pdf_map[f] = os.path.join(root, f)
-st.success(f"Loaded Excel ({len(df)} rows) and {len(pdf_map)} PDFs")
-
-# 2) Column mapping
-st.header("2) Map columns")
+# Detect columns heuristically
 cols = list(df.columns)
 if not cols:
-    st.error("Excel has no columns.")
+    st.error("Excel contains no columns.")
     st.stop()
 
-ht_col = st.selectbox("Hallticket column", cols, index=0)
-cand_email_col = st.selectbox("Candidate Email column", cols, index=1 if len(cols)>1 else 0)
-loc_col = st.selectbox("Location column", cols, index=2 if len(cols)>2 else 0)
+detected_ht_col = next((c for c in cols if "hall" in c.lower() or "ticket" in c.lower()), cols[0])
+detected_email_col = next((c for c in cols if "email" in c.lower() or "mail" in c.lower()), cols[1] if len(cols) > 1 else cols[0])
+detected_loc_col = next((c for c in cols if "loc" in c.lower() or "center" in c.lower() or "city" in c.lower()), cols[2] if len(cols) > 2 else cols[0])
 
-st.subheader("Preview")
-preview_rows = st.number_input("Preview rows", min_value=5, max_value=2000, value=50, step=5)
-st.dataframe(df.head(preview_rows), use_container_width=True)
+ht_col = st.selectbox("Hallticket column", cols, index=cols.index(detected_ht_col))
+email_col = st.selectbox("Recipient Email column", cols, index=cols.index(detected_email_col))
+location_col = st.selectbox("Location column", cols, index=cols.index(detected_loc_col))
 
-# 3) Recipient source & extraction
-st.header("3) Recipient source & auto-fill")
+st.subheader("Excel preview (first 10 rows)")
+st.dataframe(df[[ht_col, email_col, location_col]].head(10), use_container_width=True)
 
-candidate_recipient_cols = [c for c in cols if any(k in c.lower() for k in ("recipient","coord","contact","coordinator","manager","contact_person"))]
+# ---------------- Extract PDFs (nested) ----------------
+st.header("2) Extract PDFs from ZIP (nested supported)")
+extraction_root = tempfile.mkdtemp(prefix="aiclex_all_unzips_")
+with st.spinner("Extracting ZIP (this may take a moment for nested zips)..."):
+    try:
+        uploaded_zip_bytes = uploaded_zip.read()
+        extracted_pdf_paths = extract_zip_bytes_recursively(uploaded_zip_bytes, extraction_root)
+    except Exception as e:
+        st.error("ZIP extraction error: " + str(e))
+        extracted_pdf_paths = []
 
-recip_source_option = st.selectbox("Recipient source", [
-    "Coordinator/Recipient column (use exact column below)",
-    "Choose a specific column (pick below)",
-    "Aggregate candidate emails per location (use candidate email column)"
-])
+st.success(f"Extraction finished — found {len(extracted_pdf_paths)} PDFs.")
+if len(extracted_pdf_paths) == 0:
+    st.warning("No PDFs found inside the uploaded ZIP. Check the archive structure.")
+    st.stop()
 
-chosen_coord_col = None
-chosen_spec_col = None
-if recip_source_option == "Coordinator/Recipient column (use exact column below)":
-    if candidate_recipient_cols:
-        chosen_coord_col = st.selectbox("Choose coordinator/recipient column (expected to contain emails)", ["--none--"] + candidate_recipient_cols)
-        if chosen_coord_col == "--none--":
-            chosen_coord_col = None
-    else:
-        st.info("No coordinator-like columns detected. Pick 'Choose a specific column' or use aggregate candidate emails.")
-elif recip_source_option == "Choose a specific column (pick below)":
-    chosen_spec_col = st.selectbox("Pick the column that contains recipient EMAILs", ["--none--"] + cols)
-    if chosen_spec_col == "--none--":
-        chosen_spec_col = None
+# Show sample of extracted files
+st.subheader("Extracted PDFs (sample)")
+sample_list = [{"basename": os.path.basename(p), "path": p, "size": human_bytes(os.path.getsize(p))} for p in extracted_pdf_paths[:200]]
+st.dataframe(pd.DataFrame(sample_list), use_container_width=True)
 
-# locations
-df[loc_col] = df[loc_col].astype(str).str.strip()
-location_values = sorted(df[loc_col].fillna("(empty)").unique())
-
-# Function: build default_recips by extracting emails
-def build_default_recips():
-    defaults = {}
-    if chosen_coord_col:
-        for loc in location_values:
-            vals = df[df[loc_col] == loc][chosen_coord_col].astype(str).tolist()
-            found = []
-            for v in vals:
-                for e in extract_emails_from_text(v):
-                    if e not in found:
-                        found.append(e)
-            defaults[loc] = ";".join(found)
-    elif chosen_spec_col:
-        for loc in location_values:
-            vals = df[df[loc_col] == loc][chosen_spec_col].astype(str).tolist()
-            found = []
-            for v in vals:
-                for e in extract_emails_from_text(v):
-                    if e not in found:
-                        found.append(e)
-            defaults[loc] = ";".join(found)
-    else:
-        use_suggest = st.checkbox("Auto-suggest from candidate email column (top N)", value=True)
-        top_n = st.number_input("Top N emails per location to suggest", min_value=1, max_value=10, value=3)
-        for loc in location_values:
-            if use_suggest:
-                rows = df[df[loc_col] == loc]
-                extracted = []
-                for v in rows[cand_email_col].astype(str).tolist():
-                    extracted += extract_emails_from_text(v)
-                cnt = Counter([e for e in extracted if e])
-                top = [e for e,_ in cnt.most_common(top_n)]
-                defaults[loc] = ";".join(top)
-            else:
-                defaults[loc] = ""
-    return defaults
-
-default_recips = build_default_recips()
-
-# DEBUG PANEL: show counts & samples
-st.subheader("Auto-fill debug (extracted recipients preview)")
-debug_rows = []
-for loc in location_values:
-    vals = default_recips.get(loc,"").split(";") if default_recips.get(loc) else []
-    debug_rows.append({"Location": loc, "ExtractedCount": len(vals), "Sample": ";".join(vals[:3])})
-st.dataframe(pd.DataFrame(debug_rows).head(200), use_container_width=True)
-
-# 4) Auto-populate session_state recipients if empty (this is the fix)
-if "location_recipients" not in st.session_state:
-    st.session_state["location_recipients"] = {}
-
-# If the user changed recipient source, we want to fill only empty textareas (so user edits are preserved)
-# We'll set a marker in session_state when we last auto-filled so that repeated runs don't overwrite manual edits.
-last_fill_key = "_last_autofill_signature"
-# signature = chosen selection + chosen column name
-signature = f"{recip_source_option}::{chosen_coord_col or chosen_spec_col or cand_email_col}"
-
-if st.session_state.get(last_fill_key) != signature:
-    # auto-fill where empty
-    for loc in location_values:
-        cur = st.session_state["location_recipients"].get(loc, "").strip()
-        if not cur and default_recips.get(loc):
-            st.session_state["location_recipients"][loc] = default_recips.get(loc)
-    st.session_state[last_fill_key] = signature
-
-st.header("4) Edit recipients per location (auto-populated above)")
-st.markdown("Edit recipients if needed. Use semicolon `;` or comma `,` separators. Only valid emails will be used for sending.")
-
-for loc in location_values:
-    key = f"recips__{loc}"
-    initial = st.session_state["location_recipients"].get(loc, default_recips.get(loc,""))
-    val = st.text_area(f"Recipients for {loc} (semicolon separated)", value=initial, key=key, height=70)
-    # save edited value
-    st.session_state["location_recipients"][loc] = val.strip()
-
-# quick validation
-invalid_locs = []
-for loc in location_values:
-    raw = st.session_state["location_recipients"].get(loc,"")
-    items = [x.strip() for x in re.split(r"[;,\n]+", raw) if x.strip()]
-    emails = [x for x in items if looks_like_email(x)]
-    if raw and not emails:
-        invalid_locs.append(loc)
-if invalid_locs:
-    st.warning("Some locations have recipient text but no valid emails: " + ", ".join(invalid_locs))
-
-# 5) Mapping summary (match PDFs)
-st.header("5) Mapping summary")
-candidate_map = defaultdict(list)
-grouped_pdfs = defaultdict(list)
-for _, row in df.iterrows():
-    ht = str(row.get(ht_col,"")).strip()
-    em = str(row.get(cand_email_col,"")).strip()
-    loc = str(row.get(loc_col,"")).strip()
-    matched = None
+# ---------------- Build pdf_map by hallticket extracted from filename ----------------
+pdf_map = {}  # hallticket_str -> pdf_absolute_path (last wins)
+for p in extracted_pdf_paths:
+    ht = extract_hallticket_from_filename(p)
     if ht:
-        candidates = [f"{ht}.pdf", f"{ht.upper()}.pdf", f"{ht.lower()}.pdf"]
-        for c in candidates:
-            if c in pdf_map:
-                matched = pdf_map[c]; break
-        if not matched:
-            for fn,p in pdf_map.items():
-                if ht in fn:
-                    matched = p; break
-    if matched:
-        grouped_pdfs[loc].append(matched)
-    candidate_map[em].append({"hallticket": ht, "pdf": matched, "location": loc})
+        pdf_map[ht] = p
 
-summary_rows = []
-for loc in location_values:
-    files = [p for p in grouped_pdfs.get(loc,[]) if p]
-    total_bytes = sum(os.path.getsize(p) for p in files) if files else 0
-    summary_rows.append({"Location": loc, "Rows": int((df[loc_col]==loc).sum()), "MatchedPDFs": len(files), "TotalSize": human_bytes(total_bytes), "RecipientsPreview": st.session_state["location_recipients"].get(loc,"")})
-st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+# ---------------- Matching Excel rows to PDFs ----------------
+st.header("3) Match Halltickets to PDFs & Group by Location")
+mapping_rows = []
+grouped_by_location = defaultdict(list)  # location -> list of (pdf_path, recipient_email)
 
-# 6) Prepare & Send
-st.header("6) Prepare & Send")
+for idx, row in df.iterrows():
+    ht_val = str(row.get(ht_col, "")).strip()
+    recipient = str(row.get(email_col, "")).strip()
+    location = str(row.get(location_col, "")).strip()
+    matched_path = pdf_map.get(ht_val)
+    mapping_rows.append({
+        "Sr No": idx+1,
+        "Hallticket": ht_val,
+        "Recipient": recipient,
+        "Location": location,
+        "Matched": "Yes" if matched_path else "No",
+        "MatchedFile": os.path.basename(matched_path) if matched_path else ""
+    })
+    if matched_path:
+        grouped_by_location[location].append((matched_path, recipient))
+
+map_df = pd.DataFrame(mapping_rows)
+st.subheader("Mapping Preview (first 200 rows)")
+st.dataframe(map_df.head(200), use_container_width=True)
+
+# Allow download mapping CSV
+csv_buf = io.StringIO()
+map_df.to_csv(csv_buf, index=False)
+st.download_button("Download mapping_check.csv", data=csv_buf.getvalue(), file_name="mapping_check.csv", mime="text/csv")
+
+# ---------------- Auto-fill & Edit Recipients per Location ----------------
+st.header("4) Recipients per Location (auto-filled — edit if required)")
+if "location_recipients" not in st.session_state:
+    st.session_state.location_recipients = {}
+
+all_locations = sorted(list(set(str(r).strip() for r in df[location_col].astype(str).unique())))
+
+for loc in all_locations:
+    # auto-suggest: top 3 emails from Excel rows for this location
+    if not st.session_state.location_recipients.get(loc):
+        rows = df[df[location_col].astype(str).str.strip() == loc]
+        extracted = []
+        for v in rows[email_col].astype(str).tolist():
+            extracted += EMAIL_RE.findall(v)
+        # unique preserve order
+        seen = []
+        for e in extracted:
+            if e not in seen:
+                seen.append(e)
+        st.session_state.location_recipients[loc] = ";".join(seen[:3])
+    # editable text area for each location
+    st.session_state.location_recipients[loc] = st.text_area(f"Recipients for: {loc}", value=st.session_state.location_recipients[loc], key=f"recip_{loc}", height=70)
+
+# Validate recipients
+invalid_locs = []
+for loc in all_locations:
+    raw = st.session_state.location_recipients.get(loc, "")
+    if raw:
+        parts = [x.strip() for x in re.split(r"[;,\n]+", raw) if x.strip()]
+        valid = [p for p in parts if EMAIL_RE.search(p)]
+        if raw and not valid:
+            invalid_locs.append(loc)
+if invalid_locs:
+    st.warning("These locations have recipient text but no valid emails: " + ", ".join(invalid_locs))
+
+# ---------------- Prepare & Send (with Test Mode, progress, spinners, logs) ----------------
+st.header("5) Prepare ZIP(s) & Send Emails")
+
+attachment_limit_mb = st.number_input("Per-attachment size limit (MB) — use 3 for clients with 3MB limit", value=3.0, step=0.5)
+attachment_limit_bytes = int(float(attachment_limit_mb) * 1024 * 1024)
 
 def validate_all_recipients():
     errs = []
-    for loc in location_values:
-        raw = st.session_state["location_recipients"].get(loc,"")
-        items = [x.strip() for x in re.split(r"[;,\n]+", raw) if x.strip()]
-        valid = [x for x in items if looks_like_email(x)]
-        if raw and not valid:
-            errs.append(f"{loc}: no valid emails in '{raw[:100]}'")
-    return (len(errs)==0, errs)
+    for loc in all_locations:
+        raw = st.session_state.location_recipients.get(loc, "")
+        if raw:
+            parts = [x.strip() for x in re.split(r"[;,\n]+", raw) if x.strip()]
+            val = [p for p in parts if EMAIL_RE.search(p)]
+            if not val:
+                errs.append(loc)
+    return errs
 
-if st.button("Prepare & Send All (use Test Mode during checks)"):
-    ok, errs = validate_all_recipients()
-    if not ok:
-        st.error("Recipient validation failed. Fix recipient entries first:\n" + "\n".join(errs))
+if st.button("Prepare & Send All (use Test Mode recommended)"):
+    bad = validate_all_recipients()
+    if bad:
+        st.error("Fix recipient entries for: " + ", ".join(bad))
         st.stop()
 
-    smtp_cfg = {"host": smtp_host, "port": int(smtp_port), "use_ssl": True if protocol.startswith("SMTPS") else False, "sender": sender_email, "password": sender_password}
+    # SMTP quick test (fail early)
+    smtp_cfg = {
+        "host": smtp_host,
+        "port": int(smtp_port),
+        "use_ssl": bool(smtp_use_ssl),
+        "sender": smtp_sender,
+        "password": smtp_password
+    }
     try:
         if smtp_cfg["use_ssl"]:
-            srv = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
+            t = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
         else:
-            srv = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
-            if smtp_cfg["port"] == 587:
-                srv.starttls()
+            t = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
+            t.starttls()
         if smtp_cfg.get("password"):
-            srv.login(smtp_cfg["sender"], smtp_cfg["password"])
-        srv.quit()
-        st.success("SMTP login OK")
+            t.login(smtp_cfg["sender"], smtp_cfg["password"])
+        t.quit()
+        st.success("SMTP connection / login successful (checked).")
     except Exception as e:
-        st.error("SMTP login failed: " + str(e))
+        st.error("SMTP test failed: " + str(e))
         st.stop()
 
-    logs = []
-    max_bytes = int(float(attachment_limit_mb) * 1024 * 1024)
-    for loc in location_values:
-        pdfs = [p for p in grouped_pdfs.get(loc,[]) if p]
-        raw = st.session_state["location_recipients"].get(loc,"")
-        recipients = [r.strip() for r in re.split(r"[;,\n]+", raw) if looks_like_email(r.strip())]
-        if test_mode and test_email:
-            recipients = [test_email]
-        if not recipients:
-            logs.append({"Location": loc, "Status": "Skipped", "Reason": "No recipients/invalid emails"})
+    # Build list of (location, unique_files, recipients_list)
+    tasks = []
+    for loc, items in grouped_by_location.items():
+        files = list(dict.fromkeys([p for p, _ in items]))  # unique file paths
+        if not files:
             continue
-        if not pdfs:
-            logs.append({"Location": loc, "Status": "Skipped", "Reason": "No PDFs matched"})
+        # recipients: from editable per-location field
+        raw = st.session_state.location_recipients.get(loc, "")
+        recips = [r.strip() for r in re.split(r"[;,\n]+", raw) if r.strip() and EMAIL_RE.search(r)]
+        if not recips:
             continue
-        outdir = tempfile.mkdtemp(prefix=f"loc_{re.sub(r'[^a-zA-Z0-9]','_',loc)}_")
-        parts = create_chunked_zips(pdfs, out_dir=outdir, base_name=re.sub(r'[^a-zA-Z0-9]','_',loc)[:40], max_bytes=max_bytes)
-        if not parts:
-            zpath = os.path.join(outdir, f"{re.sub(r'[^a-zA-Z0-9]','_',loc)}.zip")
-            with zipfile.ZipFile(zpath,'w', compression=zipfile.ZIP_DEFLATED) as z:
-                for p in pdfs:
-                    z.write(p, arcname=os.path.basename(p))
-            parts = [{"path": zpath, "num_files": len(pdfs), "size": os.path.getsize(zpath)}]
+        tasks.append((loc, files, recips))
 
-        for recipient in recipients:
-            for idx,p in enumerate(parts, start=1):
-                subj = subject_template.format(location=loc)
+    if not tasks:
+        st.warning("No tasks to send (no matched files or no recipients).")
+        st.stop()
+
+    total_recipients = sum(len(t[2]) for t in tasks)
+    progress_bar = st.progress(0)
+    job_count = 0
+    logs = []
+
+    st.info(f"Starting send: {len(tasks)} locations, {total_recipients} recipient-addresses (test_mode={test_mode}).")
+
+    for loc, files, recips in tasks:
+        # create unique outdir
+        outdir = tempfile.mkdtemp(prefix="send_")
+        # chunk if over limit — we'll make single zip ensuring size <= limit by naive packing; for simplicity create single zip and check size
+        zip_path = create_zip_single(files, outdir, base_name=loc or "location")
+        zipped_size = os.path.getsize(zip_path)
+        if zipped_size > attachment_limit_bytes:
+            # if zip bigger than limit, try splitting by writing per-file zips until under limit
+            # simple greedy: create multiple zips with approx equal distribution
+            parts = []
+            cur = []
+            cur_size = 0
+            for f in files:
+                fsz = os.path.getsize(f)
+                if cur and (cur_size + fsz) > attachment_limit_bytes:
+                    # flush cur to zip
+                    pth = create_zip_single(cur, outdir, base_name=f"{loc}_part{len(parts)+1}")
+                    parts.append(pth)
+                    cur = [f]; cur_size = fsz
+                else:
+                    cur.append(f); cur_size += fsz
+            if cur:
+                pth = create_zip_single(cur, outdir, base_name=f"{loc}_part{len(parts)+1}")
+                parts.append(pth)
+        else:
+            parts = [zip_path]
+
+        # send to each recipient
+        for rec in recips:
+            send_to = test_email if test_mode and test_email else rec
+            for idx, part in enumerate(parts, start=1):
+                subject = subject_template.format(location=loc)
                 body = body_template.format(location=loc, footer=footer_text)
-                try:
-                    send_email(smtp_cfg, recipient, subj, body, attachment_path=p["path"], attachment_name=os.path.basename(p["path"]))
-                    logs.append({"Location": loc, "Recipient": recipient, "Part": idx, "Zip": os.path.basename(p["path"]), "Status": "Sent", "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-                except Exception as e:
-                    logs.append({"Location": loc, "Recipient": recipient, "Part": idx, "Zip": os.path.basename(p["path"]), "Status": "Failed", "Error": str(e)})
+                with st.spinner(f"Sending {os.path.basename(part)} → {send_to} (Location: {loc})"):
+                    try:
+                        send_email_smtp(smtp_cfg, send_to, subject, body, [part])
+                        logs.append({
+                            "Location": loc,
+                            "Recipient (Excel)": rec,
+                            "Sent To": send_to,
+                            "Zip": os.path.basename(part),
+                            "Status": "Sent",
+                            "Subject": subject,
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                        st.success(f"Sent: {os.path.basename(part)} → {send_to} (Location: {loc})")
+                    except Exception as e:
+                        logs.append({
+                            "Location": loc,
+                            "Recipient (Excel)": rec,
+                            "Sent To": send_to,
+                            "Zip": os.path.basename(part),
+                            "Status": "Failed",
+                            "Error": str(e)
+                        })
+                        st.error(f"Failed: {os.path.basename(part)} → {send_to} (Location: {loc}) — {e}")
+                job_count += 1
+                # update progress bar in percent (safe handling zero)
+                if total_recipients > 0:
+                    progress_bar.progress(min(100, int(job_count * 100 / (total_recipients))))
                 time.sleep(float(delay_seconds))
+
+        # cleanup per-location outdir if you want (keep for a short time)
+        try:
+            shutil.rmtree(outdir)
+        except Exception:
+            pass
+
     st.subheader("Send logs")
     st.dataframe(pd.DataFrame(logs), use_container_width=True)
-    st.success("Finished sending. Check logs and your inbox (test mode).")
+    st.success("All sending attempts complete.")
 
-# 7) Optional per-candidate sends
-if send_candidates:
-    st.header("7) Send per-candidate emails (optional)")
-    if st.button("Send per-candidate emails now"):
-        smtp_cfg = {"host": smtp_host, "port": int(smtp_port), "use_ssl": True if protocol.startswith("SMTPS") else False, "sender": sender_email, "password": sender_password}
-        try:
-            if smtp_cfg["use_ssl"]:
-                srv = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
-            else:
-                srv = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
-                if smtp_cfg["port"] == 587:
-                    srv.starttls()
-            if smtp_cfg.get("password"):
-                srv.login(smtp_cfg["sender"], smtp_cfg["password"])
-            srv.quit()
-        except Exception as e:
-            st.error("SMTP login failed: " + str(e))
-            st.stop()
+# ---------------- Cleanup temp extraction (button) ----------------
+if st.button("Cleanup temporary extracted files"):
+    try:
+        shutil.rmtree(extraction_root)
+        st.success("Temporary extraction folder removed.")
+    except Exception as e:
+        st.error("Cleanup failed: " + str(e))
 
-        cand_logs = []
-        max_bytes = int(float(attachment_limit_mb) * 1024 * 1024)
-        for cand_email, items in candidate_map.items():
-            to_addr = test_email if test_mode and test_email else cand_email
-            pdfs = [it["pdf"] for it in items if it.get("pdf")]
-            if not pdfs:
-                cand_logs.append({"Recipient": to_addr, "Status": "Skipped", "Reason": "No PDFs"})
-                continue
-            total_size = sum(os.path.getsize(p) for p in pdfs)
-            if total_size <= max_bytes:
-                tmpdir = tempfile.mkdtemp(prefix="cand_")
-                zpath = os.path.join(tmpdir, f"{re.sub(r'[^a-zA-Z0-9]','_',to_addr)}.zip")
-                with zipfile.ZipFile(zpath,'w', compression=zipfile.ZIP_DEFLATED) as z:
-                    for p in pdfs:
-                        z.write(p, arcname=os.path.basename(p))
-                subj = "Your Hall Ticket(s)"
-                body = f"Dear Candidate,\n\nPlease find attached your hall ticket(s).\n\n{footer_text}"
-                try:
-                    send_email(smtp_cfg, to_addr, subj, body, attachment_path=zpath, attachment_name=os.path.basename(zpath))
-                    cand_logs.append({"Recipient": to_addr, "Zip": os.path.basename(zpath), "Status": "Sent"})
-                except Exception as e:
-                    cand_logs.append({"Recipient": to_addr, "Zip": os.path.basename(zpath), "Status": "Failed", "Error": str(e)})
-                time.sleep(float(delay_seconds))
-            else:
-                tmpdir = tempfile.mkdtemp(prefix="candparts_")
-                parts = create_chunked_zips(pdfs, out_dir=tmpdir, base_name=re.sub(r'[^a-zA-Z0-9]','_',to_addr)[:40], max_bytes=max_bytes)
-                for idx,p in enumerate(parts, start=1):
-                    subj = f"Your Hall Ticket(s) — part {idx} of {len(parts)}"
-                    body = f"Dear Candidate,\n\nPlease find attached part {idx} of your hall ticket(s).\n\n{footer_text}"
-                    try:
-                        send_email(smtp_cfg, to_addr, subj, body, attachment_path=p["path"], attachment_name=os.path.basename(p["path"]))
-                        cand_logs.append({"Recipient": to_addr, "Part": idx, "Zip": os.path.basename(p["path"]), "Status": "Sent"})
-                    except Exception as e:
-                        cand_logs.append({"Recipient": to_addr, "Part": idx, "Zip": os.path.basename(p["path"]), "Status": "Failed", "Error": str(e)})
-                    time.sleep(float(delay_seconds))
-        st.subheader("Candidate send logs")
-        st.dataframe(pd.DataFrame(cand_logs), use_container_width=True)
-        st.success("Candidate sends complete.")
+st.info("Notes: For scanned PDFs (images), add OCR (pdf2image + pytesseract + poppler). For large volume sending consider S3 + signed links and SendGrid/SES.")
