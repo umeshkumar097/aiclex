@@ -5,20 +5,31 @@ import zipfile, os, io, tempfile, shutil, time, re
 from collections import defaultdict
 import smtplib
 from email.message import EmailMessage
-from datetime import datetime
 
-# ---------------- Settings ----------------
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 465
-SENDER_EMAIL = "info@cruxmanagement.com"
-SENDER_PASS = "norx wxop hvsm bvfu"   # App password
+# ---------------- Config ----------------
+st.set_page_config(page_title="Aiclex Hallticket Mailer", layout="wide")
 
-MAX_ATTACHMENT_MB = 3
+# ---------------- Sidebar ----------------
+with st.sidebar:
+    st.image("https://aiclex.in/wp-content/uploads/2024/08/aiclex-logo.png", width=180)
+    st.markdown("### 📧 Email Configuration")
 
-st.set_page_config(page_title="Aiclex Mailer", layout="wide")
-st.title("📧 Aiclex Technologies — Hallticket Mailer (Final Version)")
+    smtp_host = st.text_input("SMTP Host", "smtp.gmail.com")
+    smtp_port = st.number_input("SMTP Port", value=465)
+    sender_email = st.text_input("Sender Email", "info@cruxmanagement.com")
+    sender_pass = st.text_input("App Password", "norx wxop hvsm bvfu", type="password")
 
-# ---------------- Helpers ----------------
+    st.markdown("### ✉️ Templates")
+    subject_template = st.text_input("Subject", "Halltickets for {location} (Part {part}/{total})")
+    body_template = st.text_area("Body", 
+        "Dear Coordinator,\n\nPlease find attached the halltickets for {location}.\n\nRegards,\nAiclex Technologies"
+    )
+
+    st.markdown("### ⚙️ Settings")
+    delay_seconds = st.number_input("Delay between emails (seconds)", value=2.0, step=0.5)
+    max_mb = st.number_input("Attachment limit (MB)", value=3.0, step=0.5)
+
+# ---------------- Helper Functions ----------------
 def extract_zip_all(uploaded_file, extract_to):
     with zipfile.ZipFile(uploaded_file, 'r') as z:
         z.extractall(extract_to)
@@ -31,9 +42,7 @@ def extract_zip_all(uploaded_file, extract_to):
 
 def chunk_zip(file_list, out_dir, base_name, max_bytes):
     os.makedirs(out_dir, exist_ok=True)
-    parts = []
-    cur, size = [], 0
-    part = 1
+    parts, cur, size, part = [], [], 0, 1
     for f in file_list:
         sz = os.path.getsize(f)
         if size + sz > max_bytes and cur:
@@ -42,8 +51,7 @@ def chunk_zip(file_list, out_dir, base_name, max_bytes):
                 for cf in cur:
                     z.write(cf, os.path.basename(cf))
             parts.append(zip_path)
-            part += 1
-            cur, size = [], 0
+            cur, size, part = [], 0, part+1
         cur.append(f)
         size += sz
     if cur:
@@ -54,22 +62,21 @@ def chunk_zip(file_list, out_dir, base_name, max_bytes):
         parts.append(zip_path)
     return parts
 
-# ---------------- Upload ----------------
+# ---------------- Main Page ----------------
+st.title("🎯 Aiclex Hallticket Mailer — Final")
+
 excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-zip_file = st.file_uploader("Upload ZIP (PDFs inside)", type=["zip"])
-
-subject_template = st.text_input("✉️ Subject template", "Halltickets for {location} (Part {part}/{total})")
-body_template = st.text_area("📄 Body template", "Dear Coordinator,\n\nPlease find attached the halltickets for {location}.\n\nRegards,\nAiclex Technologies")
-
-delay_seconds = st.number_input("⏳ Delay between emails (seconds)", value=2.0, step=0.5)
+zip_file = st.file_uploader("Upload ZIP (PDFs, supports nested zips)", type=["zip"])
 
 if excel_file and zip_file:
     df = pd.read_excel(excel_file, dtype=str).fillna("")
-    st.write("Preview:", df.head())
+    st.success(f"Loaded Excel with {len(df)} rows")
+    st.dataframe(df.head(), width="stretch")
 
     tmpdir = tempfile.mkdtemp()
     extract_zip_all(zip_file, tmpdir)
 
+    # Map PDFs by hallticket
     pdf_map = {}
     for root, _, files in os.walk(tmpdir):
         for f in files:
@@ -78,31 +85,33 @@ if excel_file and zip_file:
                 if hall_id:
                     pdf_map[hall_id[0]] = os.path.join(root, f)
 
-    st.success(f"Extracted {len(pdf_map)} PDFs.")
+    st.info(f"Extracted {len(pdf_map)} PDFs from uploaded ZIP(s).")
 
-    # Process group
+    # Grouping logic
     groups = defaultdict(lambda: defaultdict(list))
     for _, row in df.iterrows():
         hall = str(row[0]).strip()
-        emails = re.split(r"[,;\s]+", str(row[1]))
+        raw_emails = str(row[1]).strip()
         location = str(row[2]).strip()
+
+        # Split multiple emails in same row
+        emails = [e.strip().lower() for e in re.split(r"[,;\s]+", raw_emails) if e.strip()]
         matched_pdf = pdf_map.get(hall)
         if matched_pdf:
             for e in emails:
-                if e:
-                    groups[location][e.lower()].append(matched_pdf)
+                groups[location][tuple(emails)].append(matched_pdf)  # keep row grouping
 
-    rows = []
-    all_prepared = {}
+    rows, all_prepared = [], {}
     for loc, recips in groups.items():
-        for recip, files in recips.items():
-            out_dir = os.path.join(tmpdir, f"{loc}_{recip}")
-            parts = chunk_zip(files, out_dir, f"{loc}", int(MAX_ATTACHMENT_MB*1024*1024))
-            all_prepared[(loc, recip)] = parts
+        for recip_tuple, files in recips.items():
+            recip_str = ", ".join(recip_tuple)
+            out_dir = os.path.join(tmpdir, f"{loc}_{recip_str.replace('@','_')}")
+            parts = chunk_zip(files, out_dir, f"{loc}", int(max_mb*1024*1024))
+            all_prepared[(loc, recip_str)] = parts
             for i, p in enumerate(parts, 1):
                 rows.append({
                     "Location": loc,
-                    "Recipient": recip,
+                    "Recipients": recip_str,
                     "File": os.path.basename(p),
                     "Part": f"{i}/{len(parts)}",
                     "Path": p
@@ -112,34 +121,60 @@ if excel_file and zip_file:
     st.subheader("📦 Prepared ZIP Parts Summary")
     st.dataframe(df_summary, width="stretch")
 
+    # Download links
     for _, row in df_summary.iterrows():
         with open(row["Path"], "rb") as f:
             st.download_button(
                 f"Download {row['File']} ({row['Location']} {row['Part']})",
                 f.read(),
                 file_name=row["File"],
-                key=f"dl_{row['Location']}_{row['Recipient']}_{row['File']}_{row['Part']}_{int(time.time()*1000)}"
+                key=f"dl_{row['Location']}_{row['Recipients']}_{row['File']}_{row['Part']}_{int(time.time()*1000)}"
             )
 
+    # Testing
+    test_email = st.text_input("🔬 Test email recipient", sender_email)
+    if st.button("Send Test Email"):
+        try:
+            server = smtplib.SMTP_SSL(smtp_host, int(smtp_port))
+            server.login(sender_email, sender_pass)
+            for (loc, recip_str), parts in all_prepared.items():
+                msg = EmailMessage()
+                msg["From"] = sender_email
+                msg["To"] = test_email
+                msg["Subject"] = f"[TEST] {subject_template.format(location=loc, part=1, total=len(parts))}"
+                msg.set_content(body_template.format(location=loc, part=1, total=len(parts)))
+                with open(parts[0], "rb") as f:
+                    msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=os.path.basename(parts[0]))
+                server.send_message(msg)
+                break
+            server.quit()
+            st.success("✅ Test email sent.")
+        except Exception as e:
+            st.error(f"Test failed: {e}")
+
+    # Send All
     if st.button("🚀 Send All Emails"):
         try:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
-            server.login(SENDER_EMAIL, SENDER_PASS)
-            for (loc, recip), parts in all_prepared.items():
+            server = smtplib.SMTP_SSL(smtp_host, int(smtp_port))
+            server.login(sender_email, sender_pass)
+            prog = st.progress(0)
+            total_jobs = sum(len(p) for p in all_prepared.values())
+            done = 0
+            for (loc, recip_str), parts in all_prepared.items():
                 for idx, p in enumerate(parts, 1):
                     msg = EmailMessage()
-                    msg["From"] = SENDER_EMAIL
-                    msg["To"] = recip
+                    msg["From"] = sender_email
+                    msg["To"] = recip_str
                     msg["Subject"] = subject_template.format(location=loc, part=idx, total=len(parts))
-                    body = body_template.format(location=loc, part=idx, total=len(parts))
-                    msg.set_content(body)
+                    msg.set_content(body_template.format(location=loc, part=idx, total=len(parts)))
                     with open(p, "rb") as f:
                         msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=os.path.basename(p))
                     server.send_message(msg)
-                    st.write(f"✅ Sent to {recip} ({loc}, Part {idx}/{len(parts)})")
-                    time.sleep(delay_seconds)
+                    done += 1
+                    prog.progress(done/total_jobs)
+                    time.sleep(float(delay_seconds))
             server.quit()
-            st.success("All emails sent successfully.")
+            st.success("✅ All emails sent successfully.")
         except Exception as e:
             st.error(f"Sending failed: {e}")
 
