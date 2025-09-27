@@ -4,9 +4,7 @@ import zipfile, os, io, tempfile, shutil, time, re
 from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
-from datetime import datetime
 import re
-
 # ---------- Helpers ----------
 def human_bytes(n):
     for unit in ['B','KB','MB','GB']:
@@ -71,10 +69,17 @@ with st.sidebar:
     sender_pass = st.text_input("App Password", type="password")
 
     subject_template = st.text_input("Subject Template", value="Hall Tickets for {location} - Part {part}")
-    body_template = st.text_area("Body Template", value="Dear Team,\n\nPlease find attached hall tickets for {location}.\nThis is part {part}.\n\nRegards,\nAiclex Technologies")
+    body_template = st.text_area(
+        "Body Template",
+        value="Dear Team,\n\nPlease find attached hall tickets for {location}.\nThis is part {part}.\n\nRegards,\nAiclex Technologies"
+    )
 
     size_limit_mb = st.number_input("Attachment Limit (MB)", value=3.0, step=0.5)
     delay_seconds = st.number_input("Delay Between Emails (seconds)", value=2.0, step=0.5)
+
+    st.markdown("---")
+    testing_mode = st.checkbox("Enable Testing Mode", value=False)
+    test_email = st.text_input("Test Email (for Testing Mode)", value="info@aiclex.in")
 
 # ---------- File Upload ----------
 uploaded_excel = st.file_uploader("Upload Excel", type=["xlsx", "csv"])
@@ -143,7 +148,7 @@ if uploaded_excel and uploaded_zip:
         st.session_state["prepared"] = prepared
         st.success("ZIPs prepared successfully ✅")
 
-    # --- Step 5: Show Prepared Zips in Table ---
+    # --- Step 5: Show Prepared Zips in Table with Download Column ---
     if "prepared" in st.session_state:
         st.subheader("📦 Prepared ZIP Parts Summary")
         rows = []
@@ -160,14 +165,13 @@ if uploaded_excel and uploaded_zip:
         df_summary = pd.DataFrame(rows)[["Location", "Recipients", "Part", "File", "Size"]]
         st.dataframe(df_summary, use_container_width=True)
 
-        st.markdown("### ⬇️ Download Prepared Zips")
-        for row in rows:
+        for idx, row in enumerate(rows):
             with open(row["Path"], "rb") as f:
                 st.download_button(
-                    label=f"Download {row['File']} ({row['Location']} {row['Part']})",
+                    label=f"⬇️ Download {row['File']}",
                     data=f.read(),
                     file_name=row["File"],
-                    key=f"dl_{row['Location']}_{row['File']}_{int(time.time()*1000)}"
+                    key=f"dl_{idx}"
                 )
 
     # --- Step 6: Send Emails ---
@@ -181,19 +185,38 @@ if uploaded_excel and uploaded_zip:
                 for idx, zp in enumerate(zips, 1):
                     msg = EmailMessage()
                     msg["From"] = sender_email
-                    msg["To"] = ", ".join(emails)
+                    if testing_mode:
+                        msg["To"] = test_email
+                    else:
+                        msg["To"] = ", ".join(emails)
+
                     msg["Subject"] = subject_template.format(location=loc, part=idx)
                     body = body_template.format(location=loc, part=idx)
                     msg.set_content(body)
 
                     with open(zp, "rb") as f:
-                        msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=os.path.basename(zp))
+                        msg.add_attachment(
+                            f.read(),
+                            maintype="application",
+                            subtype="zip",
+                            filename=os.path.basename(zp)
+                        )
 
                     try:
                         server.send_message(msg)
-                        logs.append({"Location": loc, "Part": idx, "Recipients": ", ".join(emails), "Status": "Sent"})
+                        logs.append({
+                            "Location": loc,
+                            "Part": idx,
+                            "Recipients": msg["To"],
+                            "Status": "Sent"
+                        })
                     except Exception as e:
-                        logs.append({"Location": loc, "Part": idx, "Recipients": ", ".join(emails), "Status": f"Failed: {e}"})
+                        logs.append({
+                            "Location": loc,
+                            "Part": idx,
+                            "Recipients": msg["To"],
+                            "Status": f"Failed: {e}"
+                        })
                     time.sleep(delay_seconds)
 
             server.quit()
