@@ -5,6 +5,7 @@ from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
 from datetime import datetime
+import re
 
 # ---------------- Helpers ----------------
 def extract_zip_recursively(zip_file_like, extract_to):
