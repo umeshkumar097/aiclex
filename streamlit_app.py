@@ -1,14 +1,14 @@
-# streamlit_app.py (FINAL VERSION)
+# streamlit_app.py (FINAL FIXED VERSION)
 import streamlit as st
 import pandas as pd
 import zipfile, os, io, tempfile, shutil, time, re
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 from email.message import EmailMessage
 import smtplib
 from datetime import datetime
 
 st.set_page_config(page_title="Aiclex Mailer — Final", layout="wide")
-st.title("📧 Aiclex Hallticket Mailer — Final (With Parts)")
+st.title("📧 Aiclex Hallticket Mailer — Final (With Parts + Fix)")
 
 # ---------------- Helpers ----------------
 def human_bytes(n):
@@ -195,9 +195,13 @@ if "prepared" in st.session_state:
         st.write(f"📍 Location: {loc} | Recipients: {', '.join(emails)} | Parts: {len(pdata['parts'])}")
         for idx, p in enumerate(pdata["parts"], start=1):
             size = human_bytes(os.path.getsize(p))
-            st.write(f" - Part {idx}/{len(pdata['parts'])}: {os.path.basename(p)} ({size})")
             with open(p, "rb") as f:
-                st.download_button(f"Download {os.path.basename(p)}", f.read(), file_name=os.path.basename(p))
+                st.download_button(
+                    label=f"Download {os.path.basename(p)}",
+                    data=f.read(),
+                    file_name=os.path.basename(p),
+                    key=f"dl_{loc}_{idx}_{os.path.basename(p)}"  # 🔑 unique key
+                )
 
 # ---------------- Send ----------------
 st.subheader("3) Send Emails")
