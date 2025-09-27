@@ -6,6 +6,7 @@ from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
 from datetime import datetime
+import re
 
 # ---------------- Config ----------------
 st.set_page_config(page_title="Aiclex Hallticket Mailer — Final", layout="wide")
