@@ -4,7 +4,6 @@ import zipfile, os, io, tempfile, shutil, time, re
 from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
-from datetime import datetime
 
 # ---------- Helpers ----------
 def human_bytes(n):
@@ -70,7 +69,10 @@ with st.sidebar:
     sender_pass = st.text_input("App Password", type="password")
 
     subject_template = st.text_input("Subject Template", value="Hall Tickets for {location} - Part {part}")
-    body_template = st.text_area("Body Template", value="Dear Team,\n\nPlease find attached hall tickets for {location}.\nThis is part {part}.\n\nRegards,\nAiclex Technologies")
+    body_template = st.text_area(
+        "Body Template",
+        value="Dear Team,\n\nPlease find attached hall tickets for {location}.\nThis is part {part}.\n\nRegards,\nAiclex Technologies"
+    )
 
     size_limit_mb = st.number_input("Attachment Limit (MB)", value=3.0, step=0.5)
     delay_seconds = st.number_input("Delay Between Emails (seconds)", value=2.0, step=0.5)
@@ -160,13 +162,13 @@ if uploaded_excel and uploaded_zip:
         st.dataframe(df_summary, use_container_width=True)
 
         st.markdown("### ⬇️ Download Prepared Zips")
-        for row in rows:
+        for idx, row in enumerate(rows):
             with open(row["Path"], "rb") as f:
                 st.download_button(
                     label=f"Download {row['File']} ({row['Location']} {row['Part']})",
                     data=f.read(),
                     file_name=row["File"],
-                    key=f"dl_{row['Location']}_{row['File']}_{int(time.time()*1000)}"
+                    key=f"dl_{row['Location']}_{row['File']}_{idx}"
                 )
 
     # --- Step 6: Send Emails ---
@@ -186,7 +188,12 @@ if uploaded_excel and uploaded_zip:
                     msg.set_content(body)
 
                     with open(zp, "rb") as f:
-                        msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=os.path.basename(zp))
+                        msg.add_attachment(
+                            f.read(),
+                            maintype="application",
+                            subtype="zip",
+                            filename=os.path.basename(zp)
+                        )
 
                     try:
                         server.send_message(msg)
