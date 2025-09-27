@@ -6,16 +6,13 @@ from email.message import EmailMessage
 import smtplib
 from datetime import datetime
 
-# ---------- Helper Functions ----------
+# ---------- Helpers ----------
 def human_bytes(n):
-    symbols = ("B", "KB", "MB", "GB")
-    prefix = {}
-    for i, s in enumerate(symbols[1:], 1):
-        prefix[s] = 1 << (i * 10)
-    for s in reversed(symbols[1:]):
-        if n >= prefix[s]:
-            return f"{n / prefix[s]:.2f} {s}"
-    return f"{n} B"
+    for unit in ['B','KB','MB','GB']:
+        if n < 1024:
+            return f"{n:.2f}{unit}"
+        n /= 1024
+    return f"{n:.2f}TB"
 
 def extract_zip_recursive(uploaded_file, extract_to):
     with zipfile.ZipFile(uploaded_file, "r") as z:
@@ -63,19 +60,24 @@ def create_chunked_zip(files, out_dir, base_name, max_size=3*1024*1024):
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Aiclex Mailer Final", layout="wide")
 st.title("📧 Aiclex Mailer — Final Version")
-st.info("Upload Excel + ZIP of PDFs → Group → Prepare Zips → Send Emails")
 
-smtp_host = st.text_input("SMTP Host", value="smtp.gmail.com")
-smtp_port = st.number_input("SMTP Port", value=465)
-sender_email = st.text_input("Sender Email", value="info@cruxmanagement.com")
-sender_pass = st.text_input("Sender Password / App Password", type="password")
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("📧 Email Settings")
+    smtp_host = st.text_input("SMTP Host", value="smtp.gmail.com")
+    smtp_port = st.number_input("SMTP Port", value=465)
+    sender_email = st.text_input("Sender Email", value="info@cruxmanagement.com")
+    sender_pass = st.text_input("App Password", type="password")
 
+    subject_template = st.text_input("Subject Template", value="Hall Tickets for {location} - Part {part}")
+    body_template = st.text_area("Body Template", value="Dear Team,\n\nPlease find attached hall tickets for {location}.\nThis is part {part}.\n\nRegards,\nAiclex Technologies")
+
+    size_limit_mb = st.number_input("Attachment Limit (MB)", value=3.0, step=0.5)
+    delay_seconds = st.number_input("Delay Between Emails (seconds)", value=2.0, step=0.5)
+
+# ---------- File Upload ----------
 uploaded_excel = st.file_uploader("Upload Excel", type=["xlsx", "csv"])
 uploaded_zip = st.file_uploader("Upload ZIP (pdfs)", type=["zip"])
-
-subject_template = st.text_input("Email Subject Template", value="Hall Tickets for {location} - Part {part}")
-body_template = st.text_area("Email Body Template", value="Dear Team,\n\nPlease find attached hall tickets for {location}.\nThis is part {part}.\n\nRegards,\nAiclex Technologies")
-size_limit_mb = st.number_input("Attachment limit (MB)", value=3.0, step=0.5)
 
 if uploaded_excel and uploaded_zip:
     # --- Step 1: Read Excel ---
@@ -105,7 +107,7 @@ if uploaded_excel and uploaded_zip:
 
     st.success(f"Extracted {len(pdf_map)} PDFs")
 
-    # --- Step 3: Group by Location + Email ---
+    # --- Step 3: Group by Location + Email(s) ---
     grouped = defaultdict(list)
     for _, row in df.iterrows():
         hall = str(row[ht_col]).strip()
@@ -113,7 +115,6 @@ if uploaded_excel and uploaded_zip:
         raw_emails = str(row[email_col]).strip()
         emails = [e.strip().lower() for e in re.split(r"[,;\n]+", raw_emails) if e.strip()]
 
-        # Match PDF by hallticket number
         matched_pdf = ""
         for fn in pdf_map:
             if hall in fn:
@@ -192,7 +193,7 @@ if uploaded_excel and uploaded_zip:
                         logs.append({"Location": loc, "Part": idx, "Recipients": ", ".join(emails), "Status": "Sent"})
                     except Exception as e:
                         logs.append({"Location": loc, "Part": idx, "Recipients": ", ".join(emails), "Status": f"Failed: {e}"})
-                    time.sleep(2)  # delay between sends
+                    time.sleep(delay_seconds)
 
             server.quit()
             st.success("All emails attempted ✅")
