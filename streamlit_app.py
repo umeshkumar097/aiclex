@@ -77,6 +77,10 @@ with st.sidebar:
     size_limit_mb = st.number_input("Attachment Limit (MB)", value=3.0, step=0.5)
     delay_seconds = st.number_input("Delay Between Emails (seconds)", value=2.0, step=0.5)
 
+    st.markdown("---")
+    testing_mode = st.checkbox("Enable Testing Mode", value=False)
+    test_email = st.text_input("Test Email (for Testing Mode)", value="info@aiclex.in")
+
 # ---------- File Upload ----------
 uploaded_excel = st.file_uploader("Upload Excel", type=["xlsx", "csv"])
 uploaded_zip = st.file_uploader("Upload ZIP (pdfs)", type=["zip"])
@@ -144,7 +148,7 @@ if uploaded_excel and uploaded_zip:
         st.session_state["prepared"] = prepared
         st.success("ZIPs prepared successfully ✅")
 
-    # --- Step 5: Show Prepared Zips in Table ---
+    # --- Step 5: Show Prepared Zips in Table with Download Column ---
     if "prepared" in st.session_state:
         st.subheader("📦 Prepared ZIP Parts Summary")
         rows = []
@@ -161,14 +165,13 @@ if uploaded_excel and uploaded_zip:
         df_summary = pd.DataFrame(rows)[["Location", "Recipients", "Part", "File", "Size"]]
         st.dataframe(df_summary, use_container_width=True)
 
-        st.markdown("### ⬇️ Download Prepared Zips")
         for idx, row in enumerate(rows):
             with open(row["Path"], "rb") as f:
                 st.download_button(
-                    label=f"Download {row['File']} ({row['Location']} {row['Part']})",
+                    label=f"⬇️ Download {row['File']}",
                     data=f.read(),
                     file_name=row["File"],
-                    key=f"dl_{row['Location']}_{row['File']}_{idx}"
+                    key=f"dl_{idx}"
                 )
 
     # --- Step 6: Send Emails ---
@@ -182,7 +185,11 @@ if uploaded_excel and uploaded_zip:
                 for idx, zp in enumerate(zips, 1):
                     msg = EmailMessage()
                     msg["From"] = sender_email
-                    msg["To"] = ", ".join(emails)
+                    if testing_mode:
+                        msg["To"] = test_email
+                    else:
+                        msg["To"] = ", ".join(emails)
+
                     msg["Subject"] = subject_template.format(location=loc, part=idx)
                     body = body_template.format(location=loc, part=idx)
                     msg.set_content(body)
@@ -197,9 +204,19 @@ if uploaded_excel and uploaded_zip:
 
                     try:
                         server.send_message(msg)
-                        logs.append({"Location": loc, "Part": idx, "Recipients": ", ".join(emails), "Status": "Sent"})
+                        logs.append({
+                            "Location": loc,
+                            "Part": idx,
+                            "Recipients": msg["To"],
+                            "Status": "Sent"
+                        })
                     except Exception as e:
-                        logs.append({"Location": loc, "Part": idx, "Recipients": ", ".join(emails), "Status": f"Failed: {e}"})
+                        logs.append({
+                            "Location": loc,
+                            "Part": idx,
+                            "Recipients": msg["To"],
+                            "Status": f"Failed: {e}"
+                        })
                     time.sleep(delay_seconds)
 
             server.quit()
