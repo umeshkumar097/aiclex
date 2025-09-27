@@ -29,7 +29,7 @@ with st.sidebar:
     delay_seconds = st.number_input("Delay between emails (seconds)", value=2.0, step=0.5)
     max_mb = st.number_input("Attachment limit (MB)", value=3.0, step=0.5)
 
-# ---------------- Helper Functions ----------------
+# ---------------- Helpers ----------------
 def extract_zip_all(uploaded_file, extract_to):
     with zipfile.ZipFile(uploaded_file, 'r') as z:
         z.extractall(extract_to)
@@ -63,7 +63,7 @@ def chunk_zip(file_list, out_dir, base_name, max_bytes):
     return parts
 
 # ---------------- Main Page ----------------
-st.title("🎯 Aiclex Hallticket Mailer — Final")
+st.title("🎯 Aiclex Hallticket Mailer — Final Clean Version")
 
 excel_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 zip_file = st.file_uploader("Upload ZIP (PDFs, supports nested zips)", type=["zip"])
@@ -87,19 +87,33 @@ if excel_file and zip_file:
 
     st.info(f"Extracted {len(pdf_map)} PDFs from uploaded ZIP(s).")
 
-    # Grouping logic
+    # Mapping Table
+    mapping_rows = []
+    for _, row in df.iterrows():
+        hall = str(row.iloc[0]).strip()
+        raw_emails = str(row.iloc[1]).strip()
+        location = str(row.iloc[2]).strip()
+        matched_file = pdf_map.get(hall, "")
+        mapping_rows.append({
+            "Hallticket": hall,
+            "Emails": raw_emails,
+            "Location": location,
+            "MatchedFile": os.path.basename(matched_file) if matched_file else "❌ Not Found"
+        })
+    df_map = pd.DataFrame(mapping_rows)
+    st.subheader("📋 Mapping Table (Hallticket ↔ PDF)")
+    st.dataframe(df_map, width="stretch")
+
+    # Grouping
     groups = defaultdict(lambda: defaultdict(list))
     for _, row in df.iterrows():
-        hall = str(row[0]).strip()
-        raw_emails = str(row[1]).strip()
-        location = str(row[2]).strip()
-
-        # Split multiple emails in same row
+        hall = str(row.iloc[0]).strip()
+        raw_emails = str(row.iloc[1]).strip()
+        location = str(row.iloc[2]).strip()
         emails = [e.strip().lower() for e in re.split(r"[,;\s]+", raw_emails) if e.strip()]
         matched_pdf = pdf_map.get(hall)
         if matched_pdf:
-            for e in emails:
-                groups[location][tuple(emails)].append(matched_pdf)  # keep row grouping
+            groups[location][tuple(emails)].append(matched_pdf)
 
     rows, all_prepared = [], {}
     for loc, recips in groups.items():
@@ -131,29 +145,41 @@ if excel_file and zip_file:
                 key=f"dl_{row['Location']}_{row['Recipients']}_{row['File']}_{row['Part']}_{int(time.time()*1000)}"
             )
 
-    # Testing
-    test_email = st.text_input("🔬 Test email recipient", sender_email)
-    if st.button("Send Test Email"):
+    # --- Testing Section ---
+    st.subheader("🔬 Testing Option")
+    test_email = st.text_input("Enter a test email address", sender_email)
+
+    if st.button("📤 Send Test Email"):
         try:
             server = smtplib.SMTP_SSL(smtp_host, int(smtp_port))
             server.login(sender_email, sender_pass)
+
             for (loc, recip_str), parts in all_prepared.items():
                 msg = EmailMessage()
                 msg["From"] = sender_email
                 msg["To"] = test_email
                 msg["Subject"] = f"[TEST] {subject_template.format(location=loc, part=1, total=len(parts))}"
-                msg.set_content(body_template.format(location=loc, part=1, total=len(parts)))
+                msg.set_content(
+                    body_template.format(location=loc, part=1, total=len(parts))
+                    + "\n\n---\n(This is a TEST email, only first part attached.)"
+                )
                 with open(parts[0], "rb") as f:
-                    msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=os.path.basename(parts[0]))
+                    msg.add_attachment(
+                        f.read(),
+                        maintype="application",
+                        subtype="zip",
+                        filename=os.path.basename(parts[0])
+                    )
                 server.send_message(msg)
                 break
             server.quit()
-            st.success("✅ Test email sent.")
+            st.success(f"✅ Test email sent to {test_email}")
         except Exception as e:
-            st.error(f"Test failed: {e}")
+            st.error(f"❌ Test failed: {e}")
 
-    # Send All
-    if st.button("🚀 Send All Emails"):
+    # --- Bulk Sending ---
+    st.subheader("🚀 Bulk Sending")
+    if st.button("Send All Emails"):
         try:
             server = smtplib.SMTP_SSL(smtp_host, int(smtp_port))
             server.login(sender_email, sender_pass)
@@ -176,7 +202,7 @@ if excel_file and zip_file:
             server.quit()
             st.success("✅ All emails sent successfully.")
         except Exception as e:
-            st.error(f"Sending failed: {e}")
+            st.error(f"❌ Sending failed: {e}")
 
     if st.button("🧹 Cleanup temporary files"):
         try:
