@@ -1,4 +1,4 @@
-# streamlit_app.py
+# streamlit_app.py (FINAL VERSION)
 import streamlit as st
 import pandas as pd
 import zipfile, os, io, tempfile, shutil, time, re
@@ -8,7 +8,7 @@ import smtplib
 from datetime import datetime
 
 st.set_page_config(page_title="Aiclex Mailer — Final", layout="wide")
-st.title("📧 Aiclex Hallticket Mailer — Final")
+st.title("📧 Aiclex Hallticket Mailer — Final (With Parts)")
 
 # ---------------- Helpers ----------------
 def human_bytes(n):
@@ -102,7 +102,7 @@ with st.sidebar:
     protocol = st.selectbox("Protocol", options=["SMTPS (SSL)", "SMTP (STARTTLS)"], index=0)
     smtp_use_ssl = True if protocol.startswith("SMTPS") else False
     sender_email = st.text_input("Sender email", value="info@cruxmanagement.com")
-    sender_password = st.text_input("Sender password (app password)", value="norx wxop hvsm bvfu", type="password")
+    sender_password = st.text_input("Sender password (App Password)", type="password", value="norx wxop hvsm bvfu")
     delay_seconds = st.number_input("Delay between emails (s)", value=2.0, step=0.5)
     per_attachment_limit_mb = st.number_input("Per-attachment limit (MB)", value=3.0, step=0.5)
 
@@ -176,7 +176,7 @@ st.write("Group summary")
 st.dataframe(pd.DataFrame(summary))
 
 # ---------------- Prepare ZIPs ----------------
-if st.button("Prepare ZIPs"):
+if st.button("2) Prepare ZIPs"):
     workdir = tempfile.mkdtemp(prefix="aiclex_zips_")
     max_bytes = int(per_attachment_limit_mb * 1024 * 1024)
     st.session_state.prepared = {}
@@ -187,22 +187,24 @@ if st.button("Prepare ZIPs"):
         base_name = re.sub(r"[^A-Za-z0-9]+", "_", loc)[:50]
         parts = create_chunked_zips(matched, workdir, base_name, max_bytes)
         st.session_state.prepared[(loc, tuple(email_key))] = {"parts": parts, "recipients": list(email_key)}
-    st.success("ZIPs prepared")
+    st.success("ZIPs prepared successfully ✅")
 
 if "prepared" in st.session_state:
-    st.write("Prepared summary")
+    st.subheader("📦 Prepared Parts Summary")
     for (loc, emails), pdata in st.session_state.prepared.items():
-        st.write(f"Location: {loc}, Recipients: {', '.join(emails)}, Parts: {len(pdata['parts'])}")
-        for p in pdata["parts"]:
-            st.write(f"- {os.path.basename(p)} ({human_bytes(os.path.getsize(p))})")
+        st.write(f"📍 Location: {loc} | Recipients: {', '.join(emails)} | Parts: {len(pdata['parts'])}")
+        for idx, p in enumerate(pdata["parts"], start=1):
+            size = human_bytes(os.path.getsize(p))
+            st.write(f" - Part {idx}/{len(pdata['parts'])}: {os.path.basename(p)} ({size})")
             with open(p, "rb") as f:
-                st.download_button("Download", f.read(), file_name=os.path.basename(p), mime="application/zip")
+                st.download_button(f"Download {os.path.basename(p)}", f.read(), file_name=os.path.basename(p))
 
 # ---------------- Send ----------------
+st.subheader("3) Send Emails")
 subject_template = st.text_input("Subject template", value="Hall Tickets — {location}")
 body_template = st.text_area("Body template", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\nRegards,\nAiclex")
 
-if st.button("Send Emails"):
+if st.button("🚀 Send All Emails"):
     if "prepared" not in st.session_state:
         st.error("No ZIPs prepared.")
     else:
@@ -220,18 +222,18 @@ if st.button("Send Emails"):
                         sender_email, sender_password,
                         pdata["recipients"], subj, body, [p]
                     )
-                    logs.append({"Location": loc, "Recipients": ", ".join(emails), "Part": idx, "Zip": os.path.basename(p), "Status": "Sent"})
+                    logs.append({"Location": loc, "Recipients": ", ".join(emails), "Part": f"{idx}/{len(pdata['parts'])}", "Zip": os.path.basename(p), "Status": "✅ Sent"})
                 except Exception as e:
-                    logs.append({"Location": loc, "Recipients": ", ".join(emails), "Part": idx, "Zip": os.path.basename(p), "Status": f"Failed {e}"})
+                    logs.append({"Location": loc, "Recipients": ", ".join(emails), "Part": f"{idx}/{len(pdata['parts'])}", "Zip": os.path.basename(p), "Status": f"❌ Failed {e}"})
                 sent_count += 1
                 prog.progress(int(sent_count*100/total_parts))
                 time.sleep(delay_seconds)
-        st.write("Logs")
+        st.write("📊 Sending Logs")
         st.dataframe(pd.DataFrame(logs))
-        st.success("Sending complete")
+        st.success("🎉 All sending attempts completed!")
 
 # ---------------- Cleanup ----------------
-if st.button("Cleanup"):
+if st.button("🧹 Cleanup Temporary Files"):
     try:
         shutil.rmtree(extract_root, ignore_errors=True)
         if "prepared" in st.session_state:
