@@ -1,4 +1,4 @@
-# streamlit_app.py (FINAL FIXED VERSION)
+# streamlit_app.py (FINAL UNIQUE KEY FIXED)
 import streamlit as st
 import pandas as pd
 import zipfile, os, io, tempfile, shutil, time, re
@@ -8,7 +8,7 @@ import smtplib
 from datetime import datetime
 
 st.set_page_config(page_title="Aiclex Mailer — Final", layout="wide")
-st.title("📧 Aiclex Hallticket Mailer — Final (With Parts + Fix)")
+st.title("📧 Aiclex Hallticket Mailer — Final (With Unique Keys + Parts)")
 
 # ---------------- Helpers ----------------
 def human_bytes(n):
@@ -42,9 +42,7 @@ def create_chunked_zips(file_paths, out_dir, base_name, max_bytes):
     """Pack file_paths into sequential zip files each <= max_bytes."""
     os.makedirs(out_dir, exist_ok=True)
     parts = []
-    cur_files = []
-    cur_size = 0
-    part_index = 1
+    cur_files, cur_size, part_index = [], 0, 1
     for fp in file_paths:
         fsz = os.path.getsize(fp)
         if fsz > max_bytes and not cur_files:
@@ -61,8 +59,7 @@ def create_chunked_zips(file_paths, out_dir, base_name, max_bytes):
                     z.write(f, arcname=os.path.basename(f))
             parts.append(zpath)
             part_index += 1
-            cur_files = [fp]
-            cur_size = fsz
+            cur_files, cur_size = [fp], fsz
         else:
             cur_files.append(fp)
             cur_size += fsz
@@ -200,7 +197,7 @@ if "prepared" in st.session_state:
                     label=f"Download {os.path.basename(p)}",
                     data=f.read(),
                     file_name=os.path.basename(p),
-                    key=f"dl_{loc}_{idx}_{os.path.basename(p)}"  # 🔑 unique key
+                    key=f"dl_{loc}_{'_'.join(emails)}_{idx}_{int(time.time()*1000)}"
                 )
 
 # ---------------- Send ----------------
