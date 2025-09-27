@@ -5,7 +5,6 @@ from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
 from datetime import datetime
-import re
 
 # ---------------- Helpers ----------------
 def extract_zip_recursively(zip_file_like, extract_to):
@@ -64,18 +63,22 @@ def create_chunked_zips(file_paths, out_dir, base_name, max_bytes):
     return parts
 
 # ---------------- UI ----------------
-st.title("📧 Aiclex Hallticket Mailer")
-st.markdown("Upload Excel + ZIP → Match halltickets → Group by (Location+Emails) → Send clean emails")
+st.title("📧 Aiclex Hallticket Mailer (Final)")
 
 # Sidebar SMTP settings
 with st.sidebar:
-    st.header("SMTP Settings")
-    smtp_host = st.text_input("SMTP host", value="smtp.hostinger.com")
+    st.header("SMTP Settings (Default Gmail)")
+    smtp_host = st.text_input("SMTP host", value="smtp.gmail.com")
     smtp_port = st.number_input("SMTP port", value=465)
     protocol = st.selectbox("Protocol", ["SMTPS (SSL)", "SMTP (STARTTLS)"], index=0)
-    sender_email = st.text_input("Sender email", value="info@aiclex.in")
-    sender_password = st.text_input("Sender password", type="password")
+    sender_email = st.text_input("Sender email", value="info@cruxmanagement.com")
+    sender_password = st.text_input("Sender password", value="norx wxop hvsm bvfu", type="password")
     delay_seconds = st.number_input("Delay between emails (sec)", value=2.0)
+
+    st.markdown("---")
+    st.subheader("Testing Mode")
+    testing_mode = st.checkbox("Enable Testing Mode (send all to test email)", value=True)
+    test_email = st.text_input("Test recipient email", value="info@aiclex.in")
 
 # File upload
 uploaded_excel = st.file_uploader("Upload Excel (.xlsx/.csv)", type=["xlsx","csv"])
@@ -114,7 +117,7 @@ if uploaded_excel and uploaded_zip:
         key = (loc, email_key)
         grouped[key].append(ht)
 
-    # Preview
+    # Preview table
     st.subheader("📋 Matching Preview")
     preview = []
     for (loc, email_set), hts in grouped.items():
@@ -125,16 +128,17 @@ if uploaded_excel and uploaded_zip:
                     matched.append(fn)
                     break
         preview.append({"Location": loc, "Emails": ", ".join(email_set), "Halltickets": len(hts), "MatchedPDFs": len(matched)})
-    st.dataframe(pd.DataFrame(preview))
+    st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
     # Subject/Body
     subject_template = st.text_input("Subject template", value="Hall Tickets — {location}")
     body_template = st.text_area("Body template", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\nRegards,\nAiclex")
 
-    # Prepare and send
+    # Prepare Zips
     if st.button("Prepare & Send Emails"):
         max_bytes = 3 * 1024 * 1024  # 3 MB
         logs = []
+        summary_rows = []
         workdir = tempfile.mkdtemp(prefix="aiclex_work_")
         for (loc, email_set), hts in grouped.items():
             matched_paths = []
@@ -149,6 +153,17 @@ if uploaded_excel and uploaded_zip:
             out_dir = os.path.join(workdir, f"{loc}_{'_'.join(email_set)}")
             os.makedirs(out_dir, exist_ok=True)
             parts = create_chunked_zips(matched_paths, out_dir, f"{loc}", max_bytes)
+
+            # Summary Preview Row
+            for idx, part in enumerate(parts, start=1):
+                summary_rows.append({
+                    "Location": loc,
+                    "Emails": ", ".join(email_set),
+                    "Part": f"{idx}/{len(parts)}",
+                    "File": os.path.basename(part),
+                    "Size": human_bytes(os.path.getsize(part))
+                })
+
             # send each part
             try:
                 if protocol.startswith("SMTPS"):
@@ -160,16 +175,26 @@ if uploaded_excel and uploaded_zip:
                 for idx, part in enumerate(parts, start=1):
                     msg = EmailMessage()
                     msg['From'] = sender_email
-                    msg['To'] = ", ".join(email_set)  # multiple TO from one row
+                    msg['To'] = test_email if testing_mode else ", ".join(email_set)
                     msg['Subject'] = f"{subject_template.format(location=loc)} (Part {idx}/{len(parts)})"
                     msg.set_content(body_template.format(location=loc))
                     with open(part, "rb") as f:
                         msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=os.path.basename(part))
                     server.send_message(msg)
-                    logs.append({"Location": loc, "Emails": ", ".join(email_set), "Zip": os.path.basename(part), "Status": "✅ Sent", "Time": datetime.now().strftime("%H:%M:%S")})
+                    logs.append({
+                        "Location": loc,
+                        "Emails": msg['To'],
+                        "Zip": os.path.basename(part),
+                        "Status": "✅ Sent",
+                        "Time": datetime.now().strftime("%H:%M:%S")
+                    })
                     time.sleep(float(delay_seconds))
                 server.quit()
             except Exception as e:
                 logs.append({"Location": loc, "Emails": ", ".join(email_set), "Status": f"❌ Failed {e}"})
-        st.success("Done sending. Log below:")
-        st.dataframe(pd.DataFrame(logs))
+        
+        st.subheader("📦 Prepared ZIP Parts Summary")
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+
+        st.subheader("📑 Sending Logs")
+        st.dataframe(pd.DataFrame(logs), use_container_width=True)
