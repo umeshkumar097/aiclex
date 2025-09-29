@@ -1,80 +1,172 @@
 # streamlit_app.py
+"""
+Aiclex Hallticket Mailer — Final with persistent SQLite send log + Resume
+Drop-in streamlit app. Run: streamlit run streamlit_app.py
+Dependencies: streamlit, pandas
+"""
+
 import streamlit as st
 import pandas as pd
-import zipfile, os, io, tempfile, shutil, time, re
+import zipfile, os, io, tempfile, shutil, time, re, sqlite3, json
 from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
 from datetime import datetime
-import re
 
 # ---------------- Config ----------------
-st.set_page_config(page_title="Aiclex Hallticket Mailer — Final", layout="wide")
-st.title("📧 Aiclex Hallticket Mailer — Final (Preview, Test, Send, Compact Downloads)")
+APP_DB = os.path.join(os.getcwd(), "send_logs.db")  # persistent DB in app working dir
+LOG_TABLE = "email_sends"
 
-# ---------------- Sidebar (settings) ----------------
+st.set_page_config(page_title="Aiclex Mailer — Safe with Resume", layout="wide")
+st.title("🛡️ Aiclex Hallticket Mailer — Safe + Resume")
+
+# ---------------- DB helpers ----------------
+def init_db():
+    conn = sqlite3.connect(APP_DB, timeout=30)
+    cur = conn.cursor()
+    cur.execute(f"""
+    CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        location TEXT,
+        recipients TEXT,
+        halltickets TEXT,
+        part TEXT,
+        file TEXT,
+        files_in_part INTEGER,
+        status TEXT,
+        error TEXT
+    )
+    """)
+    conn.commit()
+    return conn
+
+def append_log(conn, row):
+    cur = conn.cursor()
+    cur.execute(f"""
+      INSERT INTO {LOG_TABLE} (timestamp, location, recipients, halltickets, part, file, files_in_part, status, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        row.get("location",""),
+        row.get("recipients",""),
+        json.dumps(row.get("halltickets",[]), ensure_ascii=False),
+        row.get("part",""),
+        row.get("file",""),
+        int(row.get("files_in_part",0)),
+        row.get("status",""),
+        str(row.get("error",""))
+    ))
+    conn.commit()
+
+def update_log_status(conn, log_id, status, error=""):
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {LOG_TABLE} SET status=?, error=? WHERE id=?", (status, str(error), log_id))
+    conn.commit()
+
+def fetch_stats(conn):
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) FROM {LOG_TABLE}")
+    total = cur.fetchone()[0]
+    cur.execute(f"SELECT COUNT(*) FROM {LOG_TABLE} WHERE status='Sent'")
+    sent = cur.fetchone()[0]
+    cur.execute(f"SELECT COUNT(*) FROM {LOG_TABLE} WHERE status!='Sent'")
+    pending = cur.fetchone()[0]
+    cur.execute(f"SELECT COUNT(*) FROM {LOG_TABLE} WHERE status='Failed'")
+    failed = cur.fetchone()[0]
+    return {"total": total, "sent": sent, "pending": pending, "failed": failed}
+
+def fetch_pending_rows(conn):
+    cur = conn.cursor()
+    cur.execute(f"SELECT id, location, recipients, halltickets, part, file, files_in_part, status FROM {LOG_TABLE} WHERE status!='Sent' ORDER BY id")
+    rows = cur.fetchall()
+    res = []
+    for r in rows:
+        res.append({
+            "id": r[0],
+            "location": r[1],
+            "recipients": r[2],
+            "halltickets": json.loads(r[3]) if r[3] else [],
+            "part": r[4],
+            "file": r[5],
+            "files_in_part": r[6],
+            "status": r[7]
+        })
+    return res
+
+def clear_pending(conn):
+    cur = conn.cursor()
+    cur.execute(f"DELETE FROM {LOG_TABLE}")
+    conn.commit()
+
+# initialize DB connection
+conn = init_db()
+
+# ---------------- Sidebar / Settings ----------------
 with st.sidebar:
-    st.image("https://aiclex.in/wp-content/uploads/2024/08/aiclex-logo.png", width=140)
     st.header("SMTP & App Settings")
     smtp_host = st.text_input("SMTP Host", value="smtp.gmail.com")
     smtp_port = st.number_input("SMTP Port", value=465)
     protocol = st.selectbox("Protocol", ["SMTPS (SSL)", "SMTP (STARTTLS)"], index=0)
     sender_email = st.text_input("Sender Email", value="info@cruxmanagement.com")
-    sender_pass = st.text_input("App Password", value="norx wxop hvsm bvfu", type="password")
+    sender_pass = st.text_input("App Password (app password)", value="norx wxop hvsm bvfu", type="password")
 
     st.markdown("---")
-    st.header("Email Templates")
+    st.header("Email templates & sending")
     subject_template = st.text_input("Subject template", value="Hall Tickets — {location} (Part {part}/{total})")
     body_template = st.text_area("Body template", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\nRegards,\nAiclex Technologies", height=140)
 
     st.markdown("---")
-    st.header("Send Controls")
-    delay_seconds = st.number_input("Delay between emails (seconds)", value=2.0, step=0.5)
+    delay_seconds = st.number_input("Delay between emails (sec)", value=2.0, step=0.5)
     max_mb = st.number_input("Per-attachment limit (MB)", value=3.0, step=0.5)
-    st.markdown("Quick controls:")
-    testing_mode_default = st.checkbox("Default: send everything to test email (testing mode)", value=True)
+    st.markdown("Use small delay (1-3s) for deliverability; very long delays can cause SMTP to drop.")
+    st.markdown("---")
+    st.header("Testing")
+    testing_mode_default = st.checkbox("Default: testing mode (override recipients)", value=True)
     test_email_default = st.text_input("Default test email", value="info@aiclex.in")
-    st.markdown(" ")
-    st.caption("Use Preview -> Prepare -> Test -> Send flow. Use Cleanup when finished.")
 
-# ---------------- Helpers ----------------
+# show DB stats
+stats = fetch_stats(conn)
+st.sidebar.markdown(f"**Send log stats**  \nTotal attempts: {stats['total']}  \nSent: {stats['sent']}  \nPending/Failed: {stats['pending']}  \nFailed: {stats['failed']}")
+
+# ---------------- Helpers for ZIP / matching ----------------
 def extract_zip_recursively(zip_file_like, extract_to):
-    """Extract zip (file-like or path) recursively (nested zips)."""
-    with zipfile.ZipFile(zip_file_like) as z:
-        z.extractall(path=extract_to)
+    if hasattr(zip_file_like, "read"):
+        zf = zipfile.ZipFile(zip_file_like)
+    else:
+        zf = zipfile.ZipFile(zip_file_like, "r")
+    try:
+        zf.extractall(path=extract_to)
+    finally:
+        zf.close()
     for root, _, files in os.walk(extract_to):
         for f in files:
-            if f.lower().endswith('.zip'):
+            if f.lower().endswith(".zip"):
                 nested = os.path.join(root, f)
                 nested_dir = os.path.join(root, f"_nested_{os.path.splitext(f)[0]}")
                 os.makedirs(nested_dir, exist_ok=True)
                 try:
-                    with open(nested, 'rb') as nf:
+                    with open(nested, "rb") as nf:
                         extract_zip_recursively(nf, nested_dir)
                 except Exception:
-                    # skip if nested zip cannot be read
                     continue
 
 def human_bytes(n):
-    try:
-        n = float(n)
-    except:
-        return ""
+    try: n = float(n)
+    except: return ""
     for unit in ['B','KB','MB','GB','TB']:
         if n < 1024:
             return f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} PB"
 
-def create_chunked_zips(file_paths, out_dir, base_name, max_bytes):
-    """Split list of file_paths into multiple zip parts each <= max_bytes (approx)."""
+def create_chunked_zips_with_counts(file_paths, out_dir, base_name, max_bytes):
     os.makedirs(out_dir, exist_ok=True)
     parts = []
     current_files = []
     part_index = 1
     for fp in file_paths:
         current_files.append(fp)
-        # test package size
         test_path = os.path.join(out_dir, f"__test_{part_index}.zip")
         with zipfile.ZipFile(test_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
             for f in current_files:
@@ -83,63 +175,56 @@ def create_chunked_zips(file_paths, out_dir, base_name, max_bytes):
         if size <= max_bytes:
             os.remove(test_path)
             continue
-        # overflow: remove last, write current part, start new part with last
         last = current_files.pop()
         part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
         with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
             for f in current_files:
                 z.write(f, arcname=os.path.basename(f))
-        parts.append(part_path)
+        with zipfile.ZipFile(part_path, 'r') as zc:
+            names = zc.namelist()
+        parts.append({"path": part_path, "files": names, "size": os.path.getsize(part_path)})
         part_index += 1
         current_files = [last]
         os.remove(test_path)
-    # final part
     if current_files:
         part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
         with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
             for f in current_files:
                 z.write(f, arcname=os.path.basename(f))
-        parts.append(part_path)
+        with zipfile.ZipFile(part_path, 'r') as zc:
+            names = zc.namelist()
+        parts.append({"path": part_path, "files": names, "size": os.path.getsize(part_path)})
     return parts
 
 def make_download_zip(paths, out_path):
-    """Create a single zip containing all given files (temporary)."""
     with zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
         for p in paths:
-            z.write(p, arcname=os.path.basename(p))
+            if os.path.exists(p):
+                z.write(p, arcname=os.path.basename(p))
     return out_path
 
-# ---------------- Session-state defaults ----------------
-if "workdir" not in st.session_state:
-    st.session_state.workdir = None
-if "pdf_map" not in st.session_state:
-    st.session_state.pdf_map = {}
-if "grouped" not in st.session_state:
-    st.session_state.grouped = {}
-if "prepared" not in st.session_state:
-    st.session_state.prepared = {}
-if "summary_rows" not in st.session_state:
-    st.session_state.summary_rows = []
-if "cancel_requested" not in st.session_state:
-    st.session_state.cancel_requested = False
-if "skip_delay" not in st.session_state:
-    st.session_state.skip_delay = False
-if "status_msg" not in st.session_state:
-    st.session_state.status_msg = ""
+# ---------------- Session state defaults ----------------
+if "workdir" not in st.session_state: st.session_state.workdir = None
+if "pdf_map" not in st.session_state: st.session_state.pdf_map = {}
+if "grouped" not in st.session_state: st.session_state.grouped = {}
+if "prepared" not in st.session_state: st.session_state.prepared = {}
+if "summary_rows" not in st.session_state: st.session_state.summary_rows = []
+if "cancel_requested" not in st.session_state: st.session_state.cancel_requested = False
+if "skip_delay" not in st.session_state: st.session_state.skip_delay = False
+if "verified" not in st.session_state: st.session_state.verified = False
 
-# small helper to update status placeholder
-status_placeholder = st.empty()
+status_ph = st.empty()
 
-# ---------------- Upload area ----------------
-st.header("1) Upload files")
+# ---------------- Upload UI ----------------
+st.header("1) Upload Excel & ZIP")
 col1, col2 = st.columns([2,3])
 with col1:
-    uploaded_excel = st.file_uploader("Upload Excel (.xlsx or .csv) — columns: Hallticket | Emails | Location", type=["xlsx","csv"], key="excel")
+    uploaded_excel = st.file_uploader("Upload Excel (.xlsx or .csv) — contains Hallticket, Emails, Location", type=["xlsx","csv"], key="upl_excel")
 with col2:
-    uploaded_zip = st.file_uploader("Upload ZIP (PDFs; nested zips OK)", type=["zip"], key="zip")
+    uploaded_zip = st.file_uploader("Upload ZIP (PDFs; nested zips OK)", type=["zip"], key="upl_zip")
 
 if not (uploaded_excel and uploaded_zip):
-    st.info("Upload both Excel and ZIP to begin. Use the sidebar to tune SMTP/templates/settings.")
+    st.info("Upload both Excel and ZIP to begin (mapping, verify, prepare, send).")
     st.stop()
 
 # ---------------- Read Excel ----------------
@@ -152,23 +237,19 @@ except Exception as e:
     st.error("Failed to read Excel: " + str(e))
     st.stop()
 
-# column mapping
 cols = list(df.columns)
 st.subheader("2) Map columns")
 ht_col = st.selectbox("Hallticket column", cols, index=0)
-email_col = st.selectbox("Emails column (may include multiple emails separated by comma/semicolon)", cols, index=1 if len(cols)>1 else 0)
+email_col = st.selectbox("Emails column (may contain multiple separated by comma/semicolon)", cols, index=1 if len(cols)>1 else 0)
 loc_col = st.selectbox("Location column", cols, index=2 if len(cols)>2 else 0)
+st.subheader("Data preview (first 8 rows)")
+st.dataframe(df[[ht_col, email_col, loc_col]].head(8), width="stretch")
 
-# preview
-st.subheader("Data preview (first 10 rows)")
-st.dataframe(df[[ht_col, email_col, loc_col]].head(10), width="stretch")
-
-# ---------------- Extract ZIPs into workspace ----------------
+# ---------------- Extract ZIP ----------------
 if st.session_state.workdir is None:
     st.session_state.workdir = tempfile.mkdtemp(prefix="aiclex_zip_")
 workdir = st.session_state.workdir
-
-status_placeholder.info("Extracting ZIP(s) into workspace...")
+status_ph.info("Extracting uploaded ZIP into workspace...")
 try:
     bio = io.BytesIO(uploaded_zip.read())
     extract_zip_recursively(bio, workdir)
@@ -176,160 +257,194 @@ except Exception as e:
     st.error("ZIP extraction failed: " + str(e))
     st.stop()
 
-# collect pdf files
 pdf_map = {}
 for root, _, files in os.walk(workdir):
     for f in files:
         if f.lower().endswith(".pdf"):
             pdf_map[f] = os.path.join(root, f)
 st.session_state.pdf_map = pdf_map
-status_placeholder.success(f"Extracted {len(pdf_map)} PDF files into workspace: {workdir}")
+status_ph.success(f"Extracted {len(pdf_map)} PDFs into workspace: {workdir}")
 
-# ---------------- Build mapping table ----------------
+# ---------------- Mapping Excel -> PDF ----------------
 mapping_rows = []
+excel_halls = []
 for idx, row in df.iterrows():
     hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
     raw_emails = str(row[email_col]).strip() if email_col in row.index else str(row.iloc[1]).strip()
     location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
-    matched_fn = ""
-    for fn in pdf_map:
-        if hall and hall in fn:
-            matched_fn = fn
-            break
-    mapping_rows.append({"Hallticket": hall, "Emails": raw_emails, "Location": location, "MatchedFile": matched_fn or "NOT FOUND"})
+    excel_halls.append(hall)
+    matched_files = []
+    if hall:
+        hall_low = hall.lower()
+        for fn, path in pdf_map.items():
+            fn_low = fn.lower()
+            if fn_low.endswith(f"{hall_low}.pdf") or re.search(rf"[^0-9]{re.escape(hall_low)}[^0-9]", fn_low) or hall_low in fn_low:
+                matched_files.append(fn)
+    matched_files = sorted(set(matched_files))
+    mapping_rows.append({
+        "Hallticket": hall,
+        "Emails": raw_emails,
+        "Location": location,
+        "MatchedCount": len(matched_files),
+        "MatchedFiles": "; ".join(matched_files)
+    })
 map_df = pd.DataFrame(mapping_rows)
-st.subheader("3) Mapping Table (Hallticket → Matched PDF)")
+st.subheader("3) Mapping Table (Excel → PDF)")
+st.markdown("Download `mapping_check.csv` and verify.")
+st.download_button("⬇️ mapping_check.csv", data=map_df.to_csv(index=False), file_name="mapping_check.csv", mime="text/csv", key="dl_map_check")
 st.dataframe(map_df, width="stretch")
 
-# ---------------- Grouping ----------------
+# ---------------- Reverse mapping PDF -> Excel ----------------
+pdf_reverse_rows = []
+excel_set = set([str(x).strip().lower() for x in excel_halls if str(x).strip() != ""])
+for fn, p in pdf_map.items():
+    fn_low = fn.lower()
+    digits = re.findall(r"\d{4,20}", fn_low)
+    matched_hall = ""
+    for d in digits:
+        if d in excel_set:
+            matched_hall = d
+            break
+    if not matched_hall and digits:
+        last = digits[-1]
+        if last in excel_set:
+            matched_hall = last
+    pdf_reverse_rows.append({"PDFFile": fn, "DetectedHallticket": matched_hall or "", "MatchedInExcel": bool(matched_hall)})
+pdf_rev_df = pd.DataFrame(pdf_reverse_rows)
+st.subheader("4) Reverse mapping (PDF → Excel detect)")
+st.markdown("Download `extra_in_zip.csv` (PDFs not matched to any Excel hallticket).")
+extra_csv = pdf_rev_df[pdf_rev_df["MatchedInExcel"]==False].to_csv(index=False)
+st.download_button("⬇️ extra_in_zip.csv", data=extra_csv, file_name="extra_in_zip.csv", mime="text/csv", key="dl_extra")
+st.dataframe(pdf_rev_df, width="stretch")
+
+# missing (Excel halltickets with zero matches)
+missing_df = map_df[map_df["MatchedCount"] == 0][["Hallticket","Emails","Location"]]
+st.download_button("⬇️ missing_in_zip.csv", data=missing_df.to_csv(index=False), file_name="missing_in_zip.csv", mime="text/csv", key="dl_missing")
+st.markdown("---")
+
+# verification gate
+st.subheader("⚠️ Verification required")
+st.markdown("Please review the three CSVs above. After manual verification, check the box to enable Prepare & Send.")
+st.session_state.verified = st.checkbox("I have reviewed mapping_check.csv, missing_in_zip.csv, extra_in_zip.csv and confirm accuracy", value=False, key="verify_final")
+if not st.session_state.verified:
+    st.warning("Prepare & Send disabled until you verify mappings.")
+    st.stop()
+
+# ---------------- Grouping (Location + row-level recipients) ----------------
 grouped = defaultdict(list)
 for idx, row in df.iterrows():
     hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
     raw_emails = str(row[email_col]).strip() if email_col in row.index else str(row.iloc[1]).strip()
     location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
     emails = [e.strip().lower() for e in re.split(r"[,;\n]+", raw_emails) if e.strip()]
-    email_key = tuple(sorted(emails))
-    grouped[(location, email_key)].append(hall)
+    recip_key = tuple(sorted(emails))
+    grouped[(location, recip_key)].append(hall)
 st.session_state.grouped = grouped
 
-st.subheader("4) Group summary (Location + Recipients)")
-summary_list = []
-for (loc, email_key), halls in grouped.items():
-    matched = 0
-    for ht in halls:
-        for fn in pdf_map:
-            if ht and ht in fn:
-                matched += 1
-                break
-    summary_list.append({"Location": loc, "Recipients": ", ".join(email_key), "Tickets": len(halls), "MatchedPDFs": matched})
-summary_df = pd.DataFrame(summary_list)
+st.subheader("5) Group summary (Location + Recipients)")
+summary_rows = []
+for (loc, recip_key), halls in grouped.items():
+    matched_count = sum(1 for ht in halls for fn in pdf_map if ht and ht in fn)
+    summary_rows.append({"Location": loc, "Recipients": ", ".join(recip_key), "Tickets": len(halls), "MatchedPDFs": matched_count})
+summary_df = pd.DataFrame(summary_rows)
 st.dataframe(summary_df, width="stretch")
 
-# ---------------- Prepare Zips (preview) ----------------
+# ---------------- Prepare ZIPs ----------------
 st.markdown("---")
-st.subheader("5) Prepare ZIPs (Preview parts before sending)")
-
-prepare_col1, prepare_col2 = st.columns([1,1])
-with prepare_col1:
+st.subheader("6) Prepare ZIPs (create parts with counts & preview)")
+prep_col1, prep_col2 = st.columns([1,1])
+with prep_col1:
     if st.button("Prepare ZIPs (create parts)"):
-        status_placeholder.info("Preparing ZIP parts...")
         st.session_state.cancel_requested = False
+        status_ph.info("Preparing ZIP parts...")
         max_bytes = int(max_mb * 1024 * 1024)
         outroot = tempfile.mkdtemp(prefix="aiclex_out_")
         prepared = {}
         summary_rows = []
         groups = list(grouped.items())
-        total_groups = len(groups) or 1
-        prog_prep = st.progress(0)
-        for i, ((loc, email_key), halls) in enumerate(groups, start=1):
+        total = max(1, len(groups))
+        prog = st.progress(0)
+        for i, ((loc, recip_key), halls) in enumerate(groups, start=1):
             if st.session_state.cancel_requested:
-                status_placeholder.warning("Preparation cancelled by user.")
+                status_ph.warning("Preparation cancelled.")
                 break
             matched_paths = []
             for ht in halls:
-                found = None
                 for fn, p in pdf_map.items():
                     if ht and ht in fn:
-                        found = p
-                        break
-                if found:
-                    matched_paths.append(found)
-            recip_str = ", ".join(email_key)
+                        matched_paths.append(p)
+            recip_str = ", ".join(recip_key)
             if not matched_paths:
                 prepared[(loc, recip_str)] = []
-                prog_prep.progress(int(i/total_groups*100))
+                prog.progress(int(i/total*100))
                 continue
             out_dir = os.path.join(outroot, f"{loc}_{re.sub(r'[^A-Za-z0-9]', '_', recip_str)[:80]}")
             os.makedirs(out_dir, exist_ok=True)
-            parts = create_chunked_zips(matched_paths, out_dir, base_name=loc.replace(" ", "_")[:60], max_bytes=max_bytes)
+            parts = create_chunked_zips_with_counts(matched_paths, out_dir, base_name=loc.replace(" ", "_")[:60], max_bytes=max_bytes)
             prepared[(loc, recip_str)] = parts
-            for idx_part, p in enumerate(parts, start=1):
+            total_files_in_group = sum(len(pinfo["files"]) for pinfo in parts)
+            for idx_part, pinfo in enumerate(parts, start=1):
                 summary_rows.append({
                     "Location": loc,
                     "Recipients": recip_str,
                     "Part": f"{idx_part}/{len(parts)}",
-                    "File": os.path.basename(p),
-                    "Size": human_bytes(os.path.getsize(p)),
-                    "Path": p
+                    "File": os.path.basename(pinfo["path"]),
+                    "Size": human_bytes(pinfo["size"]),
+                    "FilesInPart": len(pinfo["files"]),
+                    "TotalFilesInGroup": total_files_in_group,
+                    "Path": pinfo["path"]
                 })
-            prog_prep.progress(int(i/total_groups*100))
+            prog.progress(int(i/total*100))
         st.session_state.prepared = prepared
         st.session_state.summary_rows = summary_rows
-        status_placeholder.success("Prepared ZIP parts — preview ready.")
-
-with prepare_col2:
+        status_ph.success("Prepared ZIP parts created — preview ready.")
+with prep_col2:
     if st.button("Cancel Preparation"):
         st.session_state.cancel_requested = True
-        status_placeholder.warning("Cancel requested. Preparation will stop soon.")
+        status_ph.warning("Cancel requested — preparation will stop soon.")
 
-# show preview table if prepared
-if st.session_state.summary_rows:
-    st.subheader("6) Prepared Parts Preview (select row to download)")
-    preview_df = pd.DataFrame(st.session_state.summary_rows)
-    st.dataframe(preview_df[["Location","Recipients","Part","File","Size"]], width="stretch")
+# preview prepared parts
+if st.session_state.get("summary_rows"):
+    st.subheader("7) Prepared Parts Preview")
+    prep_df = pd.DataFrame(st.session_state["summary_rows"])
+    st.download_button("⬇️ prepared_summary.csv", data=prep_df.to_csv(index=False), file_name="prepared_summary.csv", mime="text/csv", key="dl_prep")
+    st.dataframe(prep_df[["Location","Recipients","Part","File","Size","FilesInPart","TotalFilesInGroup"]], width="stretch")
 
-    # compact download controls:
-    options = [f"{i+1}. {r['Location']} — {r['File']} ({r['Part']})" for i,r in enumerate(st.session_state.summary_rows)]
-    sel_index = st.selectbox("Select a prepared part to download", options=options, index=0)
-    sel_idx = int(sel_index.split(".")[0]) - 1
-    sel_row = st.session_state.summary_rows[sel_idx]
-    # single download button for selected row
+    # compact download: select row
+    opts = [f"{i+1}. {r['Location']} — {r['File']} ({r['Part']}) [{r['FilesInPart']} files]" for i,r in enumerate(st.session_state["summary_rows"])]
+    sel = st.selectbox("Select a prepared part to download", opts, index=0, key="sel_part_ui")
+    sel_idx = int(sel.split(".")[0]) - 1
+    sel_row = st.session_state["summary_rows"][sel_idx]
     try:
         with open(sel_row["Path"], "rb") as f:
-            st.download_button(
-                label=f"⬇️ Download selected: {sel_row['File']}",
-                data=f.read(),
-                file_name=sel_row["File"],
-                key=f"dl_single_{sel_idx}"
-            )
+            st.download_button(label=f"⬇️ Download selected part", data=f.read(), file_name=sel_row["File"], key=f"dl_sel_{sel_idx}")
     except Exception as e:
-        st.warning(f"Cannot open selected file: {e}")
+        st.warning(f"Cannot open selected prepared part: {e}")
 
-    # Download all prepared parts as single zip
-    all_parts_paths = [r["Path"] for r in st.session_state.summary_rows]
-    if all_parts_paths:
-        tmp_all_zip = os.path.join(tempfile.gettempdir(), f"aiclex_all_parts_{int(time.time())}.zip")
-        if st.button("⬇️ Download ALL prepared parts as one ZIP"):
+    # download all combined
+    all_paths = [r["Path"] for r in st.session_state["summary_rows"] if os.path.exists(r["Path"])]
+    if all_paths:
+        if st.button("⬇️ Download ALL prepared parts as single ZIP"):
+            tmp_all = os.path.join(tempfile.gettempdir(), f"aiclex_all_parts_{int(time.time())}.zip")
             try:
-                make_download_zip(all_parts_paths, tmp_all_zip)
-                with open(tmp_all_zip, "rb") as af:
-                    st.download_button(label="Download ALL (single ZIP)", data=af.read(), file_name=os.path.basename(tmp_all_zip), key=f"dl_all_{int(time.time())}")
-                # remove temp combined zip after offering (not immediate deletion because streamlit needs it for download)
+                make_download_zip(all_paths, tmp_all)
+                with open(tmp_all, "rb") as af:
+                    st.download_button(label="Download combined ZIP", data=af.read(), file_name=os.path.basename(tmp_all), key=f"dl_all_{int(time.time())}")
             except Exception as e:
                 st.error("Failed to create combined download: " + str(e))
 
-# ---------------- Test send & Bulk send controls ----------------
+# ---------------- Test & Bulk send with DB logging ----------------
 st.markdown("---")
-st.subheader("7) Test send & Bulk send (with progress, skip-delay & cancel)")
+st.subheader("8) Test send, Bulk Send & Resume (persistent log)")
 
-col_a, col_b, col_c = st.columns([1,1,1])
-with col_a:
-    test_email = st.text_input("Test email (overrides recipients when used)", value=test_email_default)
+col_test, col_opts, col_send = st.columns([1,1,1])
+with col_test:
+    test_email = st.text_input("Test email (overrides recipients)", value=test_email_default, key="test_email_input")
     if st.button("Send Test Email (first available part)"):
-        if not st.session_state.prepared:
+        if not st.session_state.get("prepared"):
             st.error("No prepared parts — click Prepare ZIPs first.")
         else:
-            status_placeholder.info("Sending test email (first available part)...")
+            status_ph.info("Sending test email (first prepared part)...")
             sent = False
             try:
                 if protocol.startswith("SMTPS"):
@@ -341,7 +456,7 @@ with col_a:
                 for (loc, recip_str), parts in st.session_state.prepared.items():
                     if not parts:
                         continue
-                    first = parts[0]
+                    first = parts[0]["path"]
                     msg = EmailMessage()
                     msg["From"] = sender_email
                     msg["To"] = test_email
@@ -349,7 +464,7 @@ with col_a:
                         subj = subject_template.format(location=loc, part=1, total=len(parts))
                     except:
                         subj = f"{loc} part 1/{len(parts)}"
-                    msg["Subject"] = f"[TEST] {subj}"
+                    msg["Subject"] = "[TEST] " + subj
                     try:
                         body_txt = body_template.format(location=loc, part=1, total=len(parts))
                     except:
@@ -358,8 +473,10 @@ with col_a:
                     with open(first, "rb") as af:
                         msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(first))
                     server.send_message(msg)
+                    # log test send as Sent in DB (so resume won't re-send)
+                    append_log(conn, {"location": loc, "recipients": test_email, "halltickets": [], "part": "1/1", "file": os.path.basename(first), "files_in_part": len(parts[0]["files"]) if parts else 0, "status": "Sent", "error": ""})
                     sent = True
-                    status_placeholder.success(f"Test email sent to {test_email} with {os.path.basename(first)}")
+                    status_ph.success(f"Test email sent to {test_email} with {os.path.basename(first)}")
                     break
                 try:
                     server.quit()
@@ -370,26 +487,100 @@ with col_a:
             except Exception as e:
                 st.error("Test send failed: " + str(e))
 
-with col_b:
-    skip_delay_chk = st.checkbox("Skip delay during sending (push immediately)", value=False, key="ui_skip_delay")
+with col_opts:
+    skip_delay_chk = st.checkbox("Skip delay during sending (push immediately)", value=False, key="skip_delay_send")
     if st.button("Cancel ongoing operation"):
         st.session_state.cancel_requested = True
-        status_placeholder.warning("Cancel requested — sending will stop soon.")
+        status_ph.warning("Cancel requested — operation will stop shortly.")
 
-with col_c:
+    # Resume pending sends (DB-based)
+    if st.button("Resume Pending Sends (DB)"):
+        pending = fetch_pending_rows(conn)
+        if not pending:
+            st.info("No pending entries to resume.")
+        else:
+            status_ph.info(f"Resuming {len(pending)} pending sends...")
+            prog = st.progress(0)
+            total_pending = len(pending)
+            sent_count = 0
+            try:
+                if protocol.startswith("SMTPS"):
+                    server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
+                else:
+                    server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
+                    server.starttls()
+                server.login(sender_email, sender_pass)
+                RECONNECT_EVERY = 100
+                rc = 0
+                for i, item in enumerate(pending, start=1):
+                    if st.session_state.cancel_requested:
+                        status_ph.warning("Resume cancelled by user.")
+                        break
+                    # build email
+                    msg = EmailMessage()
+                    msg["From"] = sender_email
+                    # recipients stored as comma-separated; allow override if testing default on
+                    target_to = test_email if testing_mode_default else item["recipients"]
+                    msg["To"] = target_to
+                    try:
+                        msg["Subject"] = subject_template.format(location=item["location"], part=item["part"].split("/")[0], total=item["part"].split("/")[-1])
+                    except:
+                        msg["Subject"] = f"{item['location']} {item['part']}"
+                    msg.set_content(f"Resuming send for {item['location']} — part {item['part']}")
+                    # attach file by full path: find prepared summary row matching file
+                    fname = item["file"]
+                    # locate file path in summary_rows
+                    ppath = None
+                    for r in st.session_state.get("summary_rows", []):
+                        if r["File"] == fname:
+                            ppath = r["Path"]
+                            break
+                    if not ppath or not os.path.exists(ppath):
+                        # mark failed in DB
+                        append_log(conn, {"location": item["location"], "recipients": item["recipients"], "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "files_in_part": item.get("files_in_part",0), "status": "Failed", "error": "Prepared file missing on server"})
+                        continue
+                    with open(ppath, "rb") as af:
+                        msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(ppath))
+                    try:
+                        server.send_message(msg)
+                        append_log(conn, {"location": item["location"], "recipients": target_to, "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "files_in_part": item.get("files_in_part",0), "status": "Sent", "error": ""})
+                    except Exception as e:
+                        append_log(conn, {"location": item["location"], "recipients": target_to, "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "files_in_part": item.get("files_in_part",0), "status": "Failed", "error": str(e)})
+                    sent_count += 1
+                    rc += 1
+                    prog.progress(int(i/total_pending*100))
+                    if rc >= RECONNECT_EVERY:
+                        try: server.quit()
+                        except: pass
+                        if protocol.startswith("SMTPS"):
+                            server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
+                        else:
+                            server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
+                            server.starttls()
+                        server.login(sender_email, sender_pass)
+                        rc = 0
+                    if not skip_delay_chk:
+                        time.sleep(float(delay_seconds))
+                try: server.quit()
+                except: pass
+                status_ph.success("Resume finished (see DB logs).")
+            except Exception as e:
+                st.error("Resume failed: " + str(e))
+
+with col_send:
     if st.button("Send ALL Prepared Parts (Bulk)"):
-        if not st.session_state.prepared:
-            st.error("No prepared parts — click Prepare ZIPs first.")
+        if not st.session_state.get("prepared"):
+            st.error("No prepared parts — Prepare ZIPs first.")
         else:
             st.session_state.cancel_requested = False
-            total_parts = sum(len(p) for p in st.session_state.prepared.values())
+            total_parts = sum(len(parts) for parts in st.session_state.prepared.values())
             if total_parts == 0:
                 st.warning("No parts to send.")
             else:
-                status_placeholder.info("Starting bulk send...")
+                status_ph.info("Starting bulk send...")
                 sent_count = 0
                 logs = []
-                prog_send = st.progress(0)
+                prog = st.progress(0)
                 try:
                     if protocol.startswith("SMTPS"):
                         server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
@@ -397,19 +588,22 @@ with col_c:
                         server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
                         server.starttls()
                     server.login(sender_email, sender_pass)
-                    for (loc, recipients_str), parts in st.session_state.prepared.items():
+                    RECONNECT_EVERY = 100
+                    rc = 0
+                    for (loc, recip_str), parts in st.session_state.prepared.items():
                         if st.session_state.cancel_requested:
-                            status_placeholder.warning("Bulk send cancelled by user.")
+                            status_ph.warning("Bulk send cancelled by user.")
                             break
                         if not parts:
-                            logs.append({"Location": loc, "Recipients": recipients_str, "Part": "", "File": "", "Status": "No parts"})
+                            logs.append({"Location": loc, "Recipients": recip_str, "Part": "", "File": "", "Status": "No parts"})
                             continue
-                        for idx_part, ppath in enumerate(parts, start=1):
+                        for idx_part, pinfo in enumerate(parts, start=1):
                             if st.session_state.cancel_requested:
                                 break
+                            # determine recipient target (use testing mode if set)
+                            target_to = test_email if testing_mode_default else recip_str
                             msg = EmailMessage()
                             msg["From"] = sender_email
-                            target_to = test_email if testing_mode_default else recipients_str
                             msg["To"] = target_to
                             try:
                                 subject_line = subject_template.format(location=loc, part=idx_part, total=len(parts))
@@ -421,40 +615,77 @@ with col_c:
                             except:
                                 body_txt = f"Please find attached part {idx_part} for {loc}."
                             msg.set_content(body_txt)
-                            with open(ppath, "rb") as af:
-                                msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(ppath))
+                            with open(pinfo["path"], "rb") as af:
+                                msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(pinfo["path"]))
+                            # Log BEFORE sending as Pending (so resume can pick it up if crash occurs)
+                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
                                 server.send_message(msg)
-                                logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(ppath), "Status": "Sent", "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                                # update log as Sent by inserting new row (keeps history)
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
+                                logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "FilesInPart": len(pinfo["files"]), "Status": "Sent"})
                             except Exception as e:
-                                logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(ppath), "Status": f"Failed: {e}"})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
+                                logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "FilesInPart": len(pinfo["files"]), "Status": f"Failed: {e}"})
                             sent_count += 1
-                            prog_send.progress(int(sent_count / total_parts * 100))
-                            # delay control
+                            rc += 1
+                            prog.progress(int(sent_count / total_parts * 100))
+                            if rc >= RECONNECT_EVERY:
+                                try: server.quit()
+                                except: pass
+                                if protocol.startswith("SMTPS"):
+                                    server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
+                                else:
+                                    server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=60)
+                                    server.starttls()
+                                server.login(sender_email, sender_pass)
+                                rc = 0
                             if not skip_delay_chk:
                                 time.sleep(float(delay_seconds))
-                    try:
-                        server.quit()
-                    except:
-                        pass
-                    status_placeholder.success("Bulk send complete (or stopped).")
-                    st.subheader("Sending logs")
+                    try: server.quit()
+                    except: pass
+                    status_ph.success("Bulk send complete (or stopped). See logs below.")
+                    st.subheader("Immediate send log (recent attempts)")
                     st.dataframe(pd.DataFrame(logs), width="stretch")
                 except Exception as e:
                     st.error("Bulk send failed: " + str(e))
 
-# ---------------- Cleanup ----------------
+# ---------------- Resume info & manual DB controls ----------------
 st.markdown("---")
-if st.button("🧹 Cleanup workspace (delete extracted files & prepared parts)"):
+st.subheader("9) Persistent send log (resume / audit)")
+st.markdown("Use these buttons to inspect, export or reset the persistent send log (useful after crash).")
+col_a, col_b, col_c = st.columns([1,1,1])
+with col_a:
+    if st.button("Show send log (last 200 rows)"):
+        cur = conn.cursor()
+        cur.execute(f"SELECT id, timestamp, location, recipients, part, file, files_in_part, status, error FROM {LOG_TABLE} ORDER BY id DESC LIMIT 200")
+        rows = cur.fetchall()
+        df_logs = pd.DataFrame(rows, columns=["id","timestamp","location","recipients","part","file","files_in_part","status","error"])
+        st.dataframe(df_logs, width="stretch")
+with col_b:
+    if st.button("Download full send_log.csv"):
+        cur = conn.cursor()
+        cur.execute(f"SELECT id, timestamp, location, recipients, part, file, files_in_part, status, error FROM {LOG_TABLE} ORDER BY id")
+        rows = cur.fetchall()
+        df_logs = pd.DataFrame(rows, columns=["id","timestamp","location","recipients","part","file","files_in_part","status","error"])
+        st.download_button("⬇️ Download CSV (send_log.csv)", data=df_logs.to_csv(index=False), file_name="send_log.csv", mime="text/csv", key="dl_sendlog")
+with col_c:
+    if st.button("Start New Batch (CLEAR send_log)"):
+        if st.confirm("Are you sure? This will delete the send_log and cannot be undone. Use Resume if you want to re-attempt pending sends."):
+            clear_pending(conn)
+            st.success("send_log cleared. Starting fresh.")
+
+# ---------------- Cleanup workspace ----------------
+st.markdown("---")
+if st.button("🧹 Cleanup workspace (delete extracted & prepared files)"):
     try:
         wd = st.session_state.get("workdir")
         if wd and os.path.exists(wd):
             shutil.rmtree(wd)
-        # remove prepared parts directories too
-        for (_, _), parts in st.session_state.get("prepared", {}).items():
+        for key, parts in st.session_state.get("prepared", {}).items():
             for p in parts:
                 try:
-                    parent = os.path.dirname(p)
+                    parent = os.path.dirname(p["path"]) if isinstance(p, dict) else os.path.dirname(p)
                     if parent and os.path.exists(parent):
                         shutil.rmtree(parent)
                 except:
@@ -465,6 +696,7 @@ if st.button("🧹 Cleanup workspace (delete extracted files & prepared parts)")
         st.session_state.prepared = {}
         st.session_state.summary_rows = []
         st.session_state.cancel_requested = False
-        status_placeholder.info("Workspace cleaned.")
+        st.session_state.verified = False
+        status_ph.info("Workspace cleaned and verification reset.")
     except Exception as e:
         st.error("Cleanup failed: " + str(e))
