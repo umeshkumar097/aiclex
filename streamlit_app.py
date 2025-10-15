@@ -105,11 +105,11 @@ conn = init_db()
 # ---------------- Sidebar / Settings ----------------
 with st.sidebar:
     st.header("SMTP & App Settings")
-    smtp_host = st.text_input("SMTP Host", value="smtp.gmail.com")
-    smtp_port = st.number_input("SMTP Port", value=465)
+    smtp_host = st.text_input("SMTP Host", value=st.secrets.get("smtp_credentials", {}).get("host", "smtp.gmail.com"))
+    smtp_port = st.number_input("SMTP Port", value=st.secrets.get("smtp_credentials", {}).get("port", 465))
     protocol = st.selectbox("Protocol", ["SMTPS (SSL)", "SMTP (STARTTLS)"], index=0)
-    sender_email = st.text_input("Sender Email", value="info@cruxmanagement.com")
-    sender_pass = st.text_input("App Password (app password)", value="norx wxop hvsm bvfu", type="password")
+    sender_email = st.text_input("Sender Email", value=st.secrets.get("smtp_credentials", {}).get("sender_email", ""))
+    sender_pass = st.text_input("App Password (app password)", value=st.secrets.get("smtp_credentials", {}).get("app_password", ""), type="password")
 
     st.markdown("---")
     st.header("Email templates & sending")
@@ -123,11 +123,12 @@ with st.sidebar:
     st.markdown("---")
     st.header("Testing")
     testing_mode_default = st.checkbox("Default: testing mode (override recipients)", value=True)
-    test_email_default = st.text_input("Default test email", value="info@aiclex.in")
+    test_email_default = st.text_input("Default test email", value=st.secrets.get("smtp_credentials", {}).get("default_test_email", ""))
+
 
 # show DB stats
 stats = fetch_stats(conn)
-st.sidebar.markdown(f"**Send log stats**  \nTotal attempts: {stats['total']}  \nSent: {stats['sent']}  \nPending/Failed: {stats['pending']}  \nFailed: {stats['failed']}")
+st.sidebar.markdown(f"**Send log stats** \nTotal attempts: {stats['total']}  \nSent: {stats['sent']}  \nPending/Failed: {stats['pending']}  \nFailed: {stats['failed']}")
 
 # ---------------- Helpers for ZIP / matching ----------------
 def extract_zip_recursively(zip_file_like, extract_to):
