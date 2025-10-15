@@ -104,14 +104,7 @@ conn = init_db()
 
 # ---------------- Sidebar / Settings ----------------
 with st.sidebar:
-    st.header("SMTP & App Settings")
-    smtp_host = st.text_input("SMTP Host", value=st.secrets.get("smtp_credentials", {}).get("host", "smtp.gmail.com"))
-    smtp_port = st.number_input("SMTP Port", value=st.secrets.get("smtp_credentials", {}).get("port", 465))
-    protocol = st.selectbox("Protocol", ["SMTPS (SSL)", "SMTP (STARTTLS)"], index=0)
-    sender_email = st.text_input("Sender Email", value=st.secrets.get("smtp_credentials", {}).get("sender_email", ""))
-    sender_pass = st.text_input("App Password (app password)", value=st.secrets.get("smtp_credentials", {}).get("app_password", ""), type="password")
 
-    st.markdown("---")
     st.header("Email templates & sending")
     subject_template = st.text_input("Subject template", value="Hall Tickets — {location} (Part {part}/{total})")
     body_template = st.text_area("Body template", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\nRegards,\nAiclex Technologies", height=140)
