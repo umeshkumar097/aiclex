@@ -117,6 +117,20 @@ with st.sidebar:
     st.header("Testing")
     testing_mode_default = st.checkbox("Default: testing mode (override recipients)", value=True)
     test_email_default = st.text_input("Default test email", value=st.secrets.get("smtp_credentials", {}).get("default_test_email", ""))
+    # --- START: SMTP Config ---
+        st.subheader("SMTP Credentials")
+        smtp_creds = st.secrets.get("smtp_credentials", {})
+        
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            smtp_host = st.text_input("SMTP Host", value=smtp_creds.get("host", ""))
+            sender_email = st.text_input("Sender Email", value=smtp_creds.get("email", ""))
+        with col_s2:
+            smtp_port = st.text_input("SMTP Port", value=smtp_creds.get("port", "587"))
+            sender_pass = st.text_input("Sender Password", value=smtp_creds.get("password", ""), type="password")
+
+        protocol = st.selectbox("Protocol", ["STARTTLS", "SMTPS"], index=0 if smtp_creds.get("protocol", "STARTTLS") == "STARTTLS" else 1)
+        # --- END: SMTP Config ---
 
 
 # show DB stats
