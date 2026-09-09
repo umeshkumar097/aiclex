@@ -857,8 +857,39 @@ with col_send:
             else:
                 status_ph.info("Starting bulk send...")
                 sent_count = 0
+                failed_count = 0
                 logs = []
-                prog = st.progress(0)
+
+                # ── Live progress UI ──────────────────────────────────────
+                prog        = st.progress(0)
+                pct_ph      = st.empty()   # "47% — 47 of 100 sent"
+                m1, m2, m3  = st.columns(3)
+                sent_ph     = m1.empty()
+                remain_ph   = m2.empty()
+                failed_ph   = m3.empty()
+                feed_ph     = st.empty()   # live scrolling table
+
+                def _refresh_ui(sent, failed, total, log_rows):
+                    pct = int(sent / total * 100)
+                    prog.progress(pct)
+                    pct_ph.markdown(
+                        f"<div style='font-size:1.1rem;font-weight:700;color:#1d4ed8'>"
+                        f"{pct}%  —  {sent} of {total} sent</div>",
+                        unsafe_allow_html=True
+                    )
+                    sent_ph.metric("Sent", sent)
+                    remain_ph.metric("Remaining", total - sent)
+                    failed_ph.metric("Failed", failed)
+                    if log_rows:
+                        feed_ph.dataframe(
+                            pd.DataFrame(log_rows[::-1]),   # newest on top
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                # initial state
+                _refresh_ui(0, 0, total_parts, [])
+
                 try:
                     if protocol.startswith("SMTPS"):
                         server = smtplib.SMTP_SSL(smtp_host, int(smtp_port), timeout=60)
@@ -870,19 +901,18 @@ with col_send:
                     rc = 0
                     for (loc, recip_str), parts in st.session_state.prepared.items():
                         if st.session_state.cancel_requested:
-                            status_ph.warning("Bulk send cancelled by user.")
+                            status_ph.warning("Bulk send cancelled.")
                             break
                         if not parts:
-                            logs.append({"Location": loc, "Recipients": recip_str, "Part": "", "File": "", "Status": "No parts"})
+                            logs.append({"Location": loc, "To": recip_str, "Part": "", "File": "", "Status": "No parts"})
                             continue
                         for idx_part, pinfo in enumerate(parts, start=1):
                             if st.session_state.cancel_requested:
                                 break
-                            # determine recipient target (use testing mode if set)
                             target_to = test_email if testing_mode_default else recip_str
                             msg = EmailMessage()
                             msg["From"] = sender_email
-                            msg["To"] = target_to
+                            msg["To"]   = target_to
                             try:
                                 subject_line = subject_template.format(location=loc, part=idx_part, total=len(parts))
                             except:
@@ -895,20 +925,18 @@ with col_send:
                             msg.set_content(body_txt)
                             with open(pinfo["path"], "rb") as af:
                                 msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(pinfo["path"]))
-                            # Log BEFORE sending as Pending (so resume can pick it up if crash occurs)
-                            # file_path is stored so resume works even after server restart
                             append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
                                 server.send_message(msg)
-                                # update log as Sent by inserting new row (keeps history)
                                 append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
-                                logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "FilesInPart": len(pinfo["files"]), "Status": "Sent"})
+                                logs.append({"Location": loc, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
                             except Exception as e:
+                                failed_count += 1
                                 append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
-                                logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "FilesInPart": len(pinfo["files"]), "Status": f"Failed: {e}"})
+                                logs.append({"Location": loc, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
                             sent_count += 1
                             rc += 1
-                            prog.progress(int(sent_count / total_parts * 100))
+                            _refresh_ui(sent_count, failed_count, total_parts, logs)
                             if rc >= RECONNECT_EVERY:
                                 try: server.quit()
                                 except: pass
@@ -923,11 +951,10 @@ with col_send:
                                 time.sleep(float(delay_seconds))
                     try: server.quit()
                     except: pass
-                    status_ph.success("Bulk send complete (or stopped). See logs below.")
-                    st.subheader("Immediate send log (recent attempts)")
-                    st.dataframe(pd.DataFrame(logs), width="stretch")
+                    status_ph.success(f"Done — {sent_count} sent, {failed_count} failed out of {total_parts} total.")
                 except Exception as e:
                     st.error("Bulk send failed: " + str(e))
+
 
 # ---------------- Send Log ----------------
 st.divider()
