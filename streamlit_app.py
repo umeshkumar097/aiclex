@@ -170,39 +170,86 @@ def human_bytes(n):
     return f"{n:.2f} PB"
 
 def create_chunked_zips_with_counts(file_paths, out_dir, base_name, max_bytes):
-    os.makedirs(out_dir, exist_ok=True)
+    # Ensure output directory exists (critical on Streamlit Cloud where paths may be read-only)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError:
+        # Fallback to a writable temp directory if out_dir is not writable
+        out_dir = tempfile.mkdtemp(prefix="aiclex_zips_")
+
+    # Filter to only existing, readable files to prevent FileNotFoundError
+    file_paths = [fp for fp in file_paths if fp and os.path.isfile(fp)]
+    if not file_paths:
+        return []
+
     parts = []
     current_files = []
     part_index = 1
+
     for fp in file_paths:
         current_files.append(fp)
         test_path = os.path.join(out_dir, f"__test_{part_index}.zip")
-        with zipfile.ZipFile(test_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-            for f in current_files:
-                z.write(f, arcname=os.path.basename(f))
-        size = os.path.getsize(test_path)
-        if size <= max_bytes:
-            os.remove(test_path)
+        test_removed = False
+        try:
+            with zipfile.ZipFile(test_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+                for f in current_files:
+                    if os.path.isfile(f):
+                        z.write(f, arcname=os.path.basename(f))
+            size = os.path.getsize(test_path)
+        except Exception:
+            # If test zip creation fails, skip this file
+            current_files.pop()
+            if os.path.exists(test_path):
+                try:
+                    os.remove(test_path)
+                except OSError:
+                    pass
             continue
+
+        if size <= max_bytes:
+            try:
+                os.remove(test_path)
+            except OSError:
+                pass
+            test_removed = True
+            continue
+
+        # Current batch exceeds limit — flush all but the last file into a part
         last = current_files.pop()
         part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
-        with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-            for f in current_files:
-                z.write(f, arcname=os.path.basename(f))
-        with zipfile.ZipFile(part_path, 'r') as zc:
-            names = zc.namelist()
-        parts.append({"path": part_path, "files": names, "size": os.path.getsize(part_path)})
-        part_index += 1
+        try:
+            with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+                for f in current_files:
+                    if os.path.isfile(f):
+                        z.write(f, arcname=os.path.basename(f))
+            with zipfile.ZipFile(part_path, 'r') as zc:
+                names = zc.namelist()
+            parts.append({"path": part_path, "files": names, "size": os.path.getsize(part_path)})
+            part_index += 1
+        except Exception:
+            pass
+
         current_files = [last]
-        os.remove(test_path)
+        if not test_removed:
+            try:
+                os.remove(test_path)
+            except OSError:
+                pass
+
+    # Flush remaining files into the last part
     if current_files:
         part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
-        with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-            for f in current_files:
-                z.write(f, arcname=os.path.basename(f))
-        with zipfile.ZipFile(part_path, 'r') as zc:
-            names = zc.namelist()
-        parts.append({"path": part_path, "files": names, "size": os.path.getsize(part_path)})
+        try:
+            with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+                for f in current_files:
+                    if os.path.isfile(f):
+                        z.write(f, arcname=os.path.basename(f))
+            with zipfile.ZipFile(part_path, 'r') as zc:
+                names = zc.namelist()
+            parts.append({"path": part_path, "files": names, "size": os.path.getsize(part_path)})
+        except Exception:
+            pass
+
     return parts
 
 def make_download_zip(paths, out_path):
