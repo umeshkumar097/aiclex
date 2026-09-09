@@ -8,6 +8,10 @@ Dependencies: streamlit, pandas
 import streamlit as st
 import pandas as pd
 import zipfile, os, io, tempfile, shutil, time, re, sqlite3, json
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
 from collections import defaultdict
 from email.message import EmailMessage
 import smtplib
@@ -259,6 +263,39 @@ def make_download_zip(paths, out_path):
                 z.write(p, arcname=os.path.basename(p))
     return out_path
 
+def extract_exam_password(pdf_path):
+    """Extract the exam password from a PDF file.
+    Looks for a line/token labelled 'exam password', 'password', etc.
+    and returns the value that follows it on the same or next line.
+    Returns empty string if not found or on any error.
+    """
+    if PyPDF2 is None:
+        return ""
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            full_text = ""
+            for page in reader.pages:
+                try:
+                    full_text += (page.extract_text() or "") + "\n"
+                except Exception:
+                    continue
+        # Normalize whitespace for easier matching
+        # Pattern: after label like "Exam Password", "Password", "EXAM PASSWORD"
+        # the value follows — on same line after colon/space or on very next line
+        pattern = re.compile(
+            r'(?:exam\s*password|password)\s*[:\-]?\s*([A-Za-z0-9@#$!%^&*_\-\.]+)',
+            re.IGNORECASE
+        )
+        m = pattern.search(full_text)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+
+
 # ---------------- Session state defaults ----------------
 if "workdir" not in st.session_state: st.session_state.workdir = None
 if "pdf_map" not in st.session_state: st.session_state.pdf_map = {}
@@ -337,12 +374,21 @@ for idx, row in df.iterrows():
             if fn_low.endswith(f"{hall_low}.pdf") or re.search(rf"[^0-9]{re.escape(hall_low)}[^0-9]", fn_low) or hall_low in fn_low:
                 matched_files.append(fn)
     matched_files = sorted(set(matched_files))
+    # Extract exam password from the first matched PDF
+    password = ""
+    for fn in matched_files:
+        pdf_path = pdf_map.get(fn, "")
+        if pdf_path and os.path.isfile(pdf_path):
+            password = extract_exam_password(pdf_path)
+            if password:
+                break
     mapping_rows.append({
         "Hallticket": hall,
         "Emails": raw_emails,
         "Location": location,
         "MatchedCount": len(matched_files),
-        "MatchedFiles": "; ".join(matched_files)
+        "MatchedFiles": "; ".join(matched_files),
+        "Password": password
     })
 map_df = pd.DataFrame(mapping_rows)
 st.subheader("3) Mapping Table (Excel → PDF)")
