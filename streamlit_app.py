@@ -22,8 +22,80 @@ from datetime import datetime
 APP_DB = os.path.join(tempfile.gettempdir(), "aiclex_send_logs.db")
 LOG_TABLE = "email_sends"
 
-st.set_page_config(page_title="Aiclex Mailer — Safe with Resume", layout="wide")
-st.title("🛡️ Aiclex Hallticket Mailer — Safe + Resume")
+st.set_page_config(page_title="Aiclex Hallticket Mailer", layout="wide")
+
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Global ── */
+html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', sans-serif; }
+
+/* ── Page title ── */
+h1 { font-size: 1.6rem !important; font-weight: 700 !important;
+     color: #0f172a !important; letter-spacing: -0.5px; }
+
+/* ── Section headers ── */
+h2 { font-size: 1.1rem !important; font-weight: 600 !important;
+     color: #1e293b !important; text-transform: uppercase;
+     letter-spacing: 0.5px; margin-top: 0.5rem !important; }
+
+/* ── Metric cards ── */
+[data-testid="metric-container"] {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 12px 16px;
+}
+[data-testid="metric-container"] label { color: #64748b !important; font-size: 0.75rem !important; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { color: #0f172a !important; font-size: 1.6rem !important; font-weight: 700; }
+
+/* ── Buttons ── */
+button[kind="primary"],
+button[data-testid="baseButton-primary"] {
+    background: #1d4ed8 !important;
+    border: none !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.2px;
+}
+button[kind="secondary"],
+button[data-testid="baseButton-secondary"] {
+    border-radius: 6px !important;
+    font-weight: 500 !important;
+    border: 1px solid #cbd5e1 !important;
+    color: #334155 !important;
+}
+
+/* ── Download buttons ── */
+[data-testid="stDownloadButton"] button {
+    background: #0f766e !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+
+/* ── Divider ── */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 1.2rem 0; }
+
+/* ── Info / warning / error boxes ── */
+[data-testid="stAlert"] { border-radius: 8px !important; }
+
+/* ── Dataframe ── */
+[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; border: 1px solid #e2e8f0; }
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] { background: #f1f5f9; }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 { color: #1e293b !important; }
+
+/* ── Expander ── */
+[data-testid="stExpander"] { border: 1px solid #e2e8f0 !important; border-radius: 8px !important; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Aiclex Hallticket Mailer")
+
 
 # ---------------- DB helpers ----------------
 def init_db():
@@ -117,39 +189,46 @@ conn = init_db()
 
 # ---------------- Sidebar / Settings ----------------
 with st.sidebar:
+    st.markdown("### Settings")
+    st.divider()
 
-    st.header("Email templates & sending")
-    subject_template = st.text_input("Subject template", value="Hall Tickets — {location} (Part {part}/{total})")
-    body_template = st.text_area("Body template", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\nRegards,\nAiclex Technologies", height=140)
+    st.markdown("**Email Templates**")
+    subject_template = st.text_input("Subject", value="Hall Tickets — {location} (Part {part}/{total})")
+    body_template = st.text_area("Body", value="Dear Coordinator,\n\nPlease find attached the hall tickets for {location}.\n\nRegards,\nAiclex Technologies", height=130)
 
-    # --- START: SMTP Config (FIXED) ---
-    st.subheader("SMTP Credentials")
+    st.divider()
+    st.markdown("**SMTP Credentials**")
     smtp_creds = st.secrets.get("smtp_credentials", {})
-    
+
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        smtp_host = st.text_input("SMTP Host", value=smtp_creds.get("host", ""))
-        sender_email = st.text_input("Sender Email", value=smtp_creds.get("email", ""))
+        smtp_host = st.text_input("Host", value=smtp_creds.get("host", ""))
+        sender_email = st.text_input("Email", value=smtp_creds.get("email", ""))
     with col_s2:
-        smtp_port = st.text_input("SMTP Port", value=smtp_creds.get("port", "587"))
-        sender_pass = st.text_input("Sender Password", value=smtp_creds.get("password", ""), type="password")
+        smtp_port = st.text_input("Port", value=smtp_creds.get("port", "587"))
+        sender_pass = st.text_input("Password", value=smtp_creds.get("password", ""), type="password")
 
     protocol = st.selectbox("Protocol", ["STARTTLS", "SMTPS"], index=0 if smtp_creds.get("protocol", "STARTTLS") == "STARTTLS" else 1)
-    # --- END: SMTP Config (FIXED) ---
 
-    st.markdown("---")
-    delay_seconds = st.number_input("Delay between emails (sec)", value=2.0, step=0.5)
-    max_mb = st.number_input("Per-attachment limit (MB)", value=3.0, step=0.5)
-    st.markdown("Use small delay (1-3s) for deliverability; very long delays can cause SMTP to drop.")
-    st.markdown("---")
-    st.header("Testing")
-    testing_mode_default = st.checkbox("Default: testing mode (override recipients)", value=True)
-    test_email_default = st.text_input("Default test email", value=st.secrets.get("smtp_credentials", {}).get("default_test_email", ""))
+    st.divider()
+    st.markdown("**Send Settings**")
+    delay_seconds = st.number_input("Delay between emails (sec)", value=2.0, step=0.5, min_value=0.0)
+    max_mb = st.number_input("Max attachment size (MB)", value=3.0, step=0.5, min_value=0.5)
 
+    st.divider()
+    st.markdown("**Test Mode**")
+    testing_mode_default = st.checkbox("Override recipients (test mode)", value=True)
+    test_email_default = st.text_input("Test email address", value=st.secrets.get("smtp_credentials", {}).get("default_test_email", ""))
 
-# show DB stats
+# ---------------- Send Log Stats — metric cards at top ----------------
 stats = fetch_stats(conn)
-st.sidebar.markdown(f"**Send log stats** \nTotal attempts: {stats['total']}  \nSent: {stats['sent']}  \nPending/Failed: {stats['pending']}  \nFailed: {stats['failed']}")
+_mc1, _mc2, _mc3, _mc4 = st.columns(4)
+_mc1.metric("Total Logged", stats["total"])
+_mc2.metric("Sent", stats["sent"])
+_mc3.metric("Pending / Failed", stats["pending"])
+_mc4.metric("Failed", stats["failed"])
+st.divider()
+
 
 # ---------------- Helpers for ZIP / matching ----------------
 def extract_zip_recursively(zip_file_like, extract_to):
@@ -329,16 +408,16 @@ if "excel_halls" not in st.session_state: st.session_state.excel_halls = []
 
 status_ph = st.empty()
 
-# ---------------- Upload UI ----------------
-st.header("1) Upload Excel & ZIP")
-col1, col2 = st.columns([2,3])
+# ---------------- Upload ----------------
+st.subheader("Step 1 — Upload Files")
+col1, col2 = st.columns(2)
 with col1:
-    uploaded_excel = st.file_uploader("Upload Excel (.xlsx or .csv) — contains Hallticket, Emails, Location", type=["xlsx","csv"], key="upl_excel")
+    uploaded_excel = st.file_uploader("Excel file (.xlsx or .csv)  —  must have Hallticket, Email, Location columns", type=["xlsx","csv"], key="upl_excel")
 with col2:
-    uploaded_zip = st.file_uploader("Upload ZIP (PDFs; nested zips OK)", type=["zip"], key="upl_zip")
+    uploaded_zip = st.file_uploader("ZIP file  —  contains all PDF hall tickets (nested ZIPs supported)", type=["zip"], key="upl_zip")
 
 if not (uploaded_excel and uploaded_zip):
-    st.info("Upload both Excel and ZIP to begin (mapping, verify, prepare, send).")
+    st.info("Upload both files above to begin.")
     st.stop()
 
 # ---------------- Read Excel ----------------
@@ -351,13 +430,20 @@ except Exception as e:
     st.error("Failed to read Excel: " + str(e))
     st.stop()
 
+st.divider()
 cols = list(df.columns)
-st.subheader("2) Map columns")
-ht_col = st.selectbox("Hallticket column", cols, index=0)
-email_col = st.selectbox("Emails column (may contain multiple separated by comma/semicolon)", cols, index=1 if len(cols)>1 else 0)
-loc_col = st.selectbox("Location column", cols, index=2 if len(cols)>2 else 0)
-st.subheader("Data preview (first 8 rows)")
-st.dataframe(df[[ht_col, email_col, loc_col]].head(8), width="stretch")
+st.subheader("Step 2 — Map Columns")
+_cm1, _cm2, _cm3 = st.columns(3)
+with _cm1:
+    ht_col = st.selectbox("Hallticket column", cols, index=0)
+with _cm2:
+    email_col = st.selectbox("Email column", cols, index=1 if len(cols)>1 else 0)
+with _cm3:
+    loc_col = st.selectbox("Location column", cols, index=2 if len(cols)>2 else 0)
+
+st.caption("Data preview — first 8 rows")
+st.dataframe(df[[ht_col, email_col, loc_col]].head(8), use_container_width=True)
+
 
 # ---------------- Extract ZIP — only once per uploaded ZIP ----------------
 _zip_key = getattr(uploaded_zip, "file_id", uploaded_zip.name)
@@ -450,48 +536,54 @@ else:
     status_ph.success(f"Mapping complete — {len(mapping_rows)} rows.")
 
 map_df = pd.DataFrame(mapping_rows)
-st.subheader("3) Mapping Table (Excel → PDF)")
-st.markdown("Download `mapping_check.csv` and verify.")
-st.download_button("⬇️ mapping_check.csv", data=map_df.to_csv(index=False), file_name="mapping_check.csv", mime="text/csv", key="dl_map_check")
-st.dataframe(map_df, width="stretch")
 
-# ---------------- Reverse mapping PDF -> Excel ----------------
-pdf_reverse_rows = []
-excel_set = set([str(x).strip().lower() for x in excel_halls if str(x).strip() != ""])
-for fn, p in pdf_map.items():
-    fn_low = fn.lower()
-    digits = re.findall(r"\d{4,20}", fn_low)
-    matched_hall = ""
-    for d in digits:
-        if d in excel_set:
-            matched_hall = d
-            break
-    if not matched_hall and digits:
-        last = digits[-1]
-        if last in excel_set:
-            matched_hall = last
-    pdf_reverse_rows.append({"PDFFile": fn, "DetectedHallticket": matched_hall or "", "MatchedInExcel": bool(matched_hall)})
-pdf_rev_df = pd.DataFrame(pdf_reverse_rows)
-st.subheader("4) Reverse mapping (PDF → Excel detect)")
-st.markdown("Download `extra_in_zip.csv` (PDFs not matched to any Excel hallticket).")
-extra_csv = pdf_rev_df[pdf_rev_df["MatchedInExcel"]==False].to_csv(index=False)
-st.download_button("⬇️ extra_in_zip.csv", data=extra_csv, file_name="extra_in_zip.csv", mime="text/csv", key="dl_extra")
-st.dataframe(pdf_rev_df, width="stretch")
+st.divider()
+st.subheader("Step 3 — Mapping Results")
 
-# missing (Excel halltickets with zero matches)
-missing_df = map_df[map_df["MatchedCount"] == 0][["Hallticket","Emails","Location"]]
-st.download_button("⬇️ missing_in_zip.csv", data=missing_df.to_csv(index=False), file_name="missing_in_zip.csv", mime="text/csv", key="dl_missing")
-st.markdown("---")
+# Stats bar
+_matched_count = int((map_df["MatchedCount"] > 0).sum())
+_unmatched_count = int((map_df["MatchedCount"] == 0).sum())
+_s1, _s2, _s3 = st.columns(3)
+_s1.metric("Total Rows", len(map_df))
+_s2.metric("Matched", _matched_count)
+_s3.metric("Unmatched", _unmatched_count)
 
-# verification gate
-st.subheader("⚠️ Verification required")
-st.markdown("Please review the three CSVs above. After manual verification, check the box to enable Prepare & Send.")
-st.session_state.verified = st.checkbox("I have reviewed mapping_check.csv, missing_in_zip.csv, extra_in_zip.csv and confirm accuracy", value=False, key="verify_final")
-if not st.session_state.verified:
-    st.warning("Prepare & Send disabled until you verify mappings.")
-    st.stop()
+# Download buttons in a row
+_d1, _d2, _d3 = st.columns(3)
+with _d1:
+    st.download_button("Download mapping_check.csv", data=map_df.to_csv(index=False), file_name="mapping_check.csv", mime="text/csv", key="dl_map_check")
+with _d2:
+    missing_df = map_df[map_df["MatchedCount"] == 0][["Hallticket","Emails","Location"]]
+    st.download_button("Download missing_in_zip.csv", data=missing_df.to_csv(index=False), file_name="missing_in_zip.csv", mime="text/csv", key="dl_missing")
 
-# ---------------- Grouping (Location + row-level recipients) ----------------
+st.dataframe(map_df, use_container_width=True)
+
+# Reverse mapping — collapsed by default
+with st.expander("Reverse mapping  (PDF → Excel detect)", expanded=False):
+    pdf_reverse_rows = []
+    excel_set = set([str(x).strip().lower() for x in excel_halls if str(x).strip() != ""])
+    for fn, p in pdf_map.items():
+        fn_low = fn.lower()
+        digits = re.findall(r"\d{4,20}", fn_low)
+        matched_hall = ""
+        for d in digits:
+            if d in excel_set:
+                matched_hall = d
+                break
+        if not matched_hall and digits:
+            last = digits[-1]
+            if last in excel_set:
+                matched_hall = last
+        pdf_reverse_rows.append({"PDFFile": fn, "DetectedHallticket": matched_hall or "", "MatchedInExcel": bool(matched_hall)})
+    pdf_rev_df = pd.DataFrame(pdf_reverse_rows)
+    extra_csv = pdf_rev_df[pdf_rev_df["MatchedInExcel"]==False].to_csv(index=False)
+    st.caption(f"{len(pdf_rev_df)} total PDFs — {int(pdf_rev_df['MatchedInExcel'].sum())} matched, {int((~pdf_rev_df['MatchedInExcel']).sum())} extra")
+    st.download_button("Download extra_in_zip.csv", data=extra_csv, file_name="extra_in_zip.csv", mime="text/csv", key="dl_extra")
+    st.dataframe(pdf_rev_df, use_container_width=True)
+
+st.divider()
+
+# Grouping logic (unchanged)
 grouped = defaultdict(list)
 for idx, row in df.iterrows():
     hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
@@ -502,20 +594,32 @@ for idx, row in df.iterrows():
     grouped[(location, recip_key)].append(hall)
 st.session_state.grouped = grouped
 
-st.subheader("5) Group summary (Location + Recipients)")
-summary_rows = []
-for (loc, recip_key), halls in grouped.items():
-    matched_count = sum(1 for ht in halls for fn in pdf_map if ht and ht in fn)
-    summary_rows.append({"Location": loc, "Recipients": ", ".join(recip_key), "Tickets": len(halls), "MatchedPDFs": matched_count})
-summary_df = pd.DataFrame(summary_rows)
-st.dataframe(summary_df, width="stretch")
+# Group summary — collapsed by default
+with st.expander("Group summary  (Location + Recipients)", expanded=False):
+    summary_rows_grp = []
+    for (loc, recip_key), halls in grouped.items():
+        matched_count = sum(1 for ht in halls for fn in pdf_map if ht and ht in fn)
+        summary_rows_grp.append({"Location": loc, "Recipients": ", ".join(recip_key), "Tickets": len(halls), "MatchedPDFs": matched_count})
+    st.dataframe(pd.DataFrame(summary_rows_grp), use_container_width=True)
+
+st.divider()
+
+# Verification gate
+st.subheader("Step 4 — Verify Before Sending")
+st.caption("Review the mapping results above. Check the box below to confirm accuracy and unlock Prepare & Send.")
+st.session_state.verified = st.checkbox("I have reviewed the mapping and confirm it is accurate", value=False, key="verify_final")
+if not st.session_state.verified:
+    st.warning("Prepare & Send is locked until you confirm the mapping above.")
+    st.stop()
+
 
 # ---------------- Prepare ZIPs ----------------
-st.markdown("---")
-st.subheader("6) Prepare ZIPs (create parts with counts & preview)")
-prep_col1, prep_col2 = st.columns([1,1])
+st.subheader("Step 5 — Prepare ZIP Parts")
+st.caption(f"Max attachment size: {max_mb} MB per part. Parts will be created automatically if total size exceeds limit.")
+
+prep_col1, prep_col2 = st.columns([3, 1])
 with prep_col1:
-    if st.button("Prepare ZIPs (create parts)"):
+    if st.button("Prepare ZIPs", type="primary", use_container_width=True):
         st.session_state.cancel_requested = False
         status_ph.info("Preparing ZIP parts...")
         max_bytes = int(max_mb * 1024 * 1024)
@@ -559,34 +663,43 @@ with prep_col1:
             prog.progress(int(i/total*100))
         st.session_state.prepared = prepared
         st.session_state.summary_rows = summary_rows
-        status_ph.success("Prepared ZIP parts created — preview ready.")
+        status_ph.success("ZIP parts created — ready to send.")
 with prep_col2:
-    if st.button("Cancel Preparation"):
+    if st.button("Cancel", use_container_width=True):
         st.session_state.cancel_requested = True
-        status_ph.warning("Cancel requested — preparation will stop soon.")
+        status_ph.warning("Cancelled.")
 
-# preview prepared parts
+# Prepared parts preview
 if st.session_state.get("summary_rows"):
-    st.subheader("7) Prepared Parts Preview")
+    st.divider()
+    st.subheader("Step 6 — Prepared Parts")
     prep_df = pd.DataFrame(st.session_state["summary_rows"])
-    st.download_button("⬇️ prepared_summary.csv", data=prep_df.to_csv(index=False), file_name="prepared_summary.csv", mime="text/csv", key="dl_prep")
-    st.dataframe(prep_df[["Location","Recipients","Part","File","Size","FilesInPart","TotalFilesInGroup"]], width="stretch")
+    _total_parts = len(prep_df)
+    _total_size = sum(r.get("size", 0) if isinstance(r.get("size"), (int, float)) else 0 for r in st.session_state["summary_rows"])
 
-    # compact download: select row
-    opts = [f"{i+1}. {r['Location']} — {r['File']} ({r['Part']}) [{r['FilesInPart']} files]" for i,r in enumerate(st.session_state["summary_rows"])]
-    sel = st.selectbox("Select a prepared part to download", opts, index=0, key="sel_part_ui")
-    sel_idx = int(sel.split(".")[0]) - 1
+    _p1, _p2, _p3 = st.columns(3)
+    _p1.metric("Total Parts", _total_parts)
+    _p2.metric("Locations", prep_df["Location"].nunique())
+    _p3.metric("Total Files", int(prep_df["FilesInPart"].sum()))
+
+    st.download_button("Download prepared_summary.csv", data=prep_df.to_csv(index=False), file_name="prepared_summary.csv", mime="text/csv", key="dl_prep")
+    st.dataframe(prep_df[["Location","Recipients","Part","File","Size","FilesInPart","TotalFilesInGroup"]], use_container_width=True)
+
+    # Select and download individual part
+    opts = [f"{r['Location']}  —  {r['File']}  ({r['Part']})  [{r['FilesInPart']} files]" for r in st.session_state["summary_rows"]]
+    sel = st.selectbox("Select a part to download", opts, index=0, key="sel_part_ui")
+    sel_idx = opts.index(sel)
     sel_row = st.session_state["summary_rows"][sel_idx]
     try:
         with open(sel_row["Path"], "rb") as f:
-            st.download_button(label=f"⬇️ Download selected part", data=f.read(), file_name=sel_row["File"], key=f"dl_sel_{sel_idx}")
+            st.download_button(label="Download selected part", data=f.read(), file_name=sel_row["File"], key=f"dl_sel_{sel_idx}")
     except Exception as e:
-        st.warning(f"Cannot open selected prepared part: {e}")
+        st.warning(f"Cannot open selected part: {e}")
 
-    # download all combined
+    # Download all combined
     all_paths = [r["Path"] for r in st.session_state["summary_rows"] if os.path.exists(r["Path"])]
     if all_paths:
-        if st.button("⬇️ Download ALL prepared parts as single ZIP"):
+        if st.button("Download all parts as single ZIP", use_container_width=False):
             tmp_all = os.path.join(tempfile.gettempdir(), f"aiclex_all_parts_{int(time.time())}.zip")
             try:
                 make_download_zip(all_paths, tmp_all)
@@ -596,15 +709,16 @@ if st.session_state.get("summary_rows"):
                 st.error("Failed to create combined download: " + str(e))
 
 # ---------------- Test & Bulk send with DB logging ----------------
-st.markdown("---")
-st.subheader("8) Test send, Bulk Send & Resume (persistent log)")
+st.divider()
+st.subheader("Step 7 — Send")
 
 col_test, col_opts, col_send = st.columns([1,1,1])
 with col_test:
-    test_email = st.text_input("Test email (overrides recipients)", value=test_email_default, key="test_email_input")
-    if st.button("Send Test Email (first available part)"):
+    test_email = st.text_input("Test email address", value=test_email_default, key="test_email_input")
+    if st.button("Send Test Email", use_container_width=True):
         if not st.session_state.get("prepared"):
-            st.error("No prepared parts — click Prepare ZIPs first.")
+            st.error("No prepared parts — run Prepare ZIPs first.")
+
         else:
             status_ph.info("Sending test email (first prepared part)...")
             sent = False
@@ -650,13 +764,14 @@ with col_test:
                 st.error("Test send failed: " + str(e))
 
 with col_opts:
-    skip_delay_chk = st.checkbox("Skip delay during sending (push immediately)", value=False, key="skip_delay_send")
-    if st.button("Cancel ongoing operation"):
+    skip_delay_chk = st.checkbox("Skip delay between sends", value=False, key="skip_delay_send")
+    if st.button("Cancel Operation", use_container_width=True):
         st.session_state.cancel_requested = True
-        status_ph.warning("Cancel requested — operation will stop shortly.")
+        status_ph.warning("Cancel requested — will stop shortly.")
 
     # Resume pending sends (DB-based)
-    if st.button("Resume Pending Sends (DB)"):
+    if st.button("Resume Pending Sends", use_container_width=True):
+
         pending = fetch_pending_rows(conn)
         if not pending:
             st.info("No pending entries to resume.")
@@ -730,9 +845,10 @@ with col_opts:
                 st.error("Resume failed: " + str(e))
 
 with col_send:
-    if st.button("Send ALL Prepared Parts (Bulk)"):
+    if st.button("Send All Prepared Parts", type="primary", use_container_width=True):
         if not st.session_state.get("prepared"):
-            st.error("No prepared parts — Prepare ZIPs first.")
+            st.error("No prepared parts — run Prepare ZIPs first.")
+
         else:
             st.session_state.cancel_requested = False
             total_parts = sum(len(parts) for parts in st.session_state.prepared.values())
@@ -813,34 +929,33 @@ with col_send:
                 except Exception as e:
                     st.error("Bulk send failed: " + str(e))
 
-# ---------------- Resume info & manual DB controls ----------------
-st.markdown("---")
-st.subheader("9) Persistent send log (resume / audit)")
-st.markdown("Use these buttons to inspect, export or reset the persistent send log (useful after crash).")
-col_a, col_b, col_c = st.columns([1,1,1])
+# ---------------- Send Log ----------------
+st.divider()
+st.subheader("Send Log  —  Audit & Resume")
+st.caption("Inspect, export or reset the persistent send log. Use Resume to re-attempt any pending sends after a crash.")
+col_a, col_b, col_c = st.columns(3)
 with col_a:
-    if st.button("Show send log (last 200 rows)"):
+    if st.button("Show Send Log", use_container_width=True):
         cur = conn.cursor()
         cur.execute(f"SELECT id, timestamp, location, recipients, part, file, files_in_part, status, error FROM {LOG_TABLE} ORDER BY id DESC LIMIT 200")
         rows = cur.fetchall()
         df_logs = pd.DataFrame(rows, columns=["id","timestamp","location","recipients","part","file","files_in_part","status","error"])
-        st.dataframe(df_logs, width="stretch")
+        st.dataframe(df_logs, use_container_width=True)
 with col_b:
-    if st.button("Download full send_log.csv"):
+    if st.button("Prepare Log Download", use_container_width=True):
         cur = conn.cursor()
         cur.execute(f"SELECT id, timestamp, location, recipients, part, file, files_in_part, status, error FROM {LOG_TABLE} ORDER BY id")
         rows = cur.fetchall()
         df_logs = pd.DataFrame(rows, columns=["id","timestamp","location","recipients","part","file","files_in_part","status","error"])
-        st.download_button("⬇️ Download CSV (send_log.csv)", data=df_logs.to_csv(index=False), file_name="send_log.csv", mime="text/csv", key="dl_sendlog")
+        st.download_button("Download send_log.csv", data=df_logs.to_csv(index=False), file_name="send_log.csv", mime="text/csv", key="dl_sendlog")
 with col_c:
-    if st.button("Start New Batch (CLEAR send_log)"):
-        if st.confirm("Are you sure? This will delete the send_log and cannot be undone. Use Resume if you want to re-attempt pending sends."):
-            clear_pending(conn)
-            st.success("send_log cleared. Starting fresh.")
+    if st.button("Clear Send Log (New Batch)", use_container_width=True):
+        clear_pending(conn)
+        st.success("Send log cleared. Ready for a new batch.")
 
 # ---------------- Cleanup workspace ----------------
-st.markdown("---")
-if st.button("🧹 Cleanup workspace (delete extracted & prepared files)"):
+st.divider()
+if st.button("Clear workspace  (delete extracted and prepared files)"):
     try:
         wd = st.session_state.get("workdir")
         if wd and os.path.exists(wd):
@@ -860,6 +975,7 @@ if st.button("🧹 Cleanup workspace (delete extracted & prepared files)"):
         st.session_state.summary_rows = []
         st.session_state.cancel_requested = False
         st.session_state.verified = False
-        status_ph.info("Workspace cleaned and verification reset.")
+        status_ph.info("Workspace cleared. Upload new files to start again.")
     except Exception as e:
         st.error("Cleanup failed: " + str(e))
+
