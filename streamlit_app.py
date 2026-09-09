@@ -18,7 +18,8 @@ import smtplib
 from datetime import datetime
 
 # ---------------- Config ----------------
-APP_DB = os.path.join(os.getcwd(), "send_logs.db")  # persistent DB in app working dir
+# Use /tmp — writable on Streamlit Cloud (unlike /mount/src which is read-only)
+APP_DB = os.path.join(tempfile.gettempdir(), "aiclex_send_logs.db")
 LOG_TABLE = "email_sends"
 
 st.set_page_config(page_title="Aiclex Mailer — Safe with Resume", layout="wide")
@@ -37,19 +38,25 @@ def init_db():
         halltickets TEXT,
         part TEXT,
         file TEXT,
+        file_path TEXT DEFAULT '',
         files_in_part INTEGER,
         status TEXT,
         error TEXT
     )
     """)
+    # Migrate existing DBs that don't have file_path column yet
+    try:
+        cur.execute(f"ALTER TABLE {LOG_TABLE} ADD COLUMN file_path TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
 def append_log(conn, row):
     cur = conn.cursor()
     cur.execute(f"""
-      INSERT INTO {LOG_TABLE} (timestamp, location, recipients, halltickets, part, file, files_in_part, status, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO {LOG_TABLE} (timestamp, location, recipients, halltickets, part, file, file_path, files_in_part, status, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         row.get("location",""),
@@ -57,6 +64,7 @@ def append_log(conn, row):
         json.dumps(row.get("halltickets",[]), ensure_ascii=False),
         row.get("part",""),
         row.get("file",""),
+        row.get("file_path",""),
         int(row.get("files_in_part",0)),
         row.get("status",""),
         str(row.get("error",""))
@@ -82,7 +90,7 @@ def fetch_stats(conn):
 
 def fetch_pending_rows(conn):
     cur = conn.cursor()
-    cur.execute(f"SELECT id, location, recipients, halltickets, part, file, files_in_part, status FROM {LOG_TABLE} WHERE status!='Sent' ORDER BY id")
+    cur.execute(f"SELECT id, location, recipients, halltickets, part, file, file_path, files_in_part, status FROM {LOG_TABLE} WHERE status!='Sent' ORDER BY id")
     rows = cur.fetchall()
     res = []
     for r in rows:
@@ -93,8 +101,9 @@ def fetch_pending_rows(conn):
             "halltickets": json.loads(r[3]) if r[3] else [],
             "part": r[4],
             "file": r[5],
-            "files_in_part": r[6],
-            "status": r[7]
+            "file_path": r[6] or "",
+            "files_in_part": r[7],
+            "status": r[8]
         })
     return res
 
@@ -269,7 +278,8 @@ def make_download_zip(paths, out_path):
                 z.write(p, arcname=os.path.basename(p))
     return out_path
 
-def extract_exam_password(pdf_path):
+@st.cache_data(show_spinner=False)
+def extract_exam_password(pdf_path: str) -> str:
     """Extract the exam password from a PDF file.
     Looks for a line/token labelled 'exam password', 'password', etc.
     and returns the value that follows it on the same or next line.
@@ -311,6 +321,11 @@ if "summary_rows" not in st.session_state: st.session_state.summary_rows = []
 if "cancel_requested" not in st.session_state: st.session_state.cancel_requested = False
 if "skip_delay" not in st.session_state: st.session_state.skip_delay = False
 if "verified" not in st.session_state: st.session_state.verified = False
+# Cache keys for speed optimisation
+if "zip_extracted_for" not in st.session_state: st.session_state.zip_extracted_for = None
+if "mapping_cache_key" not in st.session_state: st.session_state.mapping_cache_key = None
+if "mapping_rows" not in st.session_state: st.session_state.mapping_rows = []
+if "excel_halls" not in st.session_state: st.session_state.excel_halls = []
 
 status_ph = st.empty()
 
@@ -344,71 +359,96 @@ loc_col = st.selectbox("Location column", cols, index=2 if len(cols)>2 else 0)
 st.subheader("Data preview (first 8 rows)")
 st.dataframe(df[[ht_col, email_col, loc_col]].head(8), width="stretch")
 
-# ---------------- Extract ZIP ----------------
-if st.session_state.workdir is None:
+# ---------------- Extract ZIP — only once per uploaded ZIP ----------------
+_zip_key = getattr(uploaded_zip, "file_id", uploaded_zip.name)
+if st.session_state.get("zip_extracted_for") != _zip_key:
+    # New ZIP uploaded — reset workdir and extract fresh
+    if st.session_state.workdir and os.path.exists(st.session_state.workdir):
+        try:
+            shutil.rmtree(st.session_state.workdir)
+        except Exception:
+            pass
     st.session_state.workdir = tempfile.mkdtemp(prefix="aiclex_zip_")
-workdir = st.session_state.workdir
-status_ph.info("Extracting uploaded ZIP into workspace...")
-try:
-    bio = io.BytesIO(uploaded_zip.read())
-    extract_zip_recursively(bio, workdir)
-except Exception as e:
-    st.error("ZIP extraction failed: " + str(e))
-    st.stop()
+    st.session_state.pdf_map = {}
+    st.session_state.mapping_cache_key = None  # invalidate mapping cache too
+    workdir = st.session_state.workdir
+    status_ph.info("Extracting uploaded ZIP into workspace...")
+    try:
+        bio = io.BytesIO(uploaded_zip.read())
+        extract_zip_recursively(bio, workdir)
+    except Exception as e:
+        st.error("ZIP extraction failed: " + str(e))
+        st.stop()
+    # Scan PDFs once and store in session_state
+    pdf_map = {}
+    for root, _, files in os.walk(workdir):
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                pdf_map[f] = os.path.join(root, f)
+    st.session_state.pdf_map = pdf_map
+    st.session_state.zip_extracted_for = _zip_key
+    status_ph.success(f"Extracted {len(pdf_map)} PDFs into workspace.")
+else:
+    # Same ZIP — reuse already-extracted files instantly
+    workdir = st.session_state.workdir
+    pdf_map = st.session_state.pdf_map
+    status_ph.success(f"Using cached workspace — {len(pdf_map)} PDFs ready.")
 
-pdf_map = {}
-for root, _, files in os.walk(workdir):
-    for f in files:
-        if f.lower().endswith(".pdf"):
-            pdf_map[f] = os.path.join(root, f)
-st.session_state.pdf_map = pdf_map
-status_ph.success(f"Extracted {len(pdf_map)} PDFs into workspace: {workdir}")
+# ---------------- Mapping Excel → PDF — cached per column selection ----------------
+_mapping_key = f"{getattr(uploaded_excel,'file_id',uploaded_excel.name)}|{_zip_key}|{ht_col}|{email_col}|{loc_col}"
+if st.session_state.get("mapping_cache_key") == _mapping_key:
+    # Column selection unchanged — reuse cached result instantly
+    mapping_rows  = st.session_state.mapping_rows
+    excel_halls   = st.session_state.excel_halls
+    status_ph.success(f"Using cached mapping — {len(mapping_rows)} rows.")
+else:
+    # Recompute mapping (columns changed or first run)
+    status_ph.info("Computing mapping...")
+    mapping_rows = []
+    excel_halls = []
+    for idx, row in df.iterrows():
+        hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
+        raw_emails = str(row[email_col]).strip() if email_col in row.index else str(row.iloc[1]).strip()
+        location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
+        excel_halls.append(hall)
+        matched_files = []
+        if hall and hall not in ("", "nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
+            hall_low = hall.lower().strip()
+            for fn, path in pdf_map.items():
+                fn_low = fn.lower()
+                # Strategy 1: filename ends exactly with the hallticket before .pdf
+                ends_match = fn_low.endswith(f"{hall_low}.pdf")
+                # Strategy 2: hallticket appears as a COMPLETE standalone number in filename
+                boundary_match = bool(re.search(
+                    rf'(?<!\d){re.escape(hall_low)}(?!\d)',
+                    fn_low
+                ))
+                if ends_match or boundary_match:
+                    matched_files.append(fn)
 
-# ---------------- Mapping Excel -> PDF ----------------
-mapping_rows = []
-excel_halls = []
-for idx, row in df.iterrows():
-    hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
-    raw_emails = str(row[email_col]).strip() if email_col in row.index else str(row.iloc[1]).strip()
-    location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
-    excel_halls.append(hall)
-    matched_files = []
-    if hall and hall not in ("", "nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
-        hall_low = hall.lower().strip()
-        for fn, path in pdf_map.items():
-            fn_low = fn.lower()
-            # Strategy 1: filename ends exactly with the hallticket before .pdf
-            #   e.g. "admit-card-5070394.pdf" ends with "5070394.pdf"  ✓
-            ends_match = fn_low.endswith(f"{hall_low}.pdf")
+        matched_files = sorted(set(matched_files))
+        # Extract exam password from the first matched PDF (cached by @st.cache_data)
+        password = ""
+        for fn in matched_files:
+            pdf_path = pdf_map.get(fn, "")
+            if pdf_path and os.path.isfile(pdf_path):
+                password = extract_exam_password(pdf_path)
+                if password:
+                    break
+        mapping_rows.append({
+            "Hallticket": hall,
+            "Emails": raw_emails,
+            "Location": location,
+            "MatchedCount": len(matched_files),
+            "MatchedFiles": "; ".join(matched_files),
+            "Password": password
+        })
+    # Save to session_state for next rerun
+    st.session_state.mapping_rows = mapping_rows
+    st.session_state.excel_halls  = excel_halls
+    st.session_state.mapping_cache_key = _mapping_key
+    status_ph.success(f"Mapping complete — {len(mapping_rows)} rows.")
 
-            # Strategy 2: hallticket appears as a COMPLETE standalone number in filename
-            #   Uses negative lookbehind (?<!\d) and negative lookahead (?!\d)
-            #   so "1" does NOT match "1036" but DOES match "-1-" or "_1." etc.
-            boundary_match = bool(re.search(
-                rf'(?<!\d){re.escape(hall_low)}(?!\d)',
-                fn_low
-            ))
-
-            if ends_match or boundary_match:
-                matched_files.append(fn)
-
-    matched_files = sorted(set(matched_files))
-    # Extract exam password from the first matched PDF
-    password = ""
-    for fn in matched_files:
-        pdf_path = pdf_map.get(fn, "")
-        if pdf_path and os.path.isfile(pdf_path):
-            password = extract_exam_password(pdf_path)
-            if password:
-                break
-    mapping_rows.append({
-        "Hallticket": hall,
-        "Emails": raw_emails,
-        "Location": location,
-        "MatchedCount": len(matched_files),
-        "MatchedFiles": "; ".join(matched_files),
-        "Password": password
-    })
 map_df = pd.DataFrame(mapping_rows)
 st.subheader("3) Mapping Table (Excel → PDF)")
 st.markdown("Download `mapping_check.csv` and verify.")
@@ -649,17 +689,17 @@ with col_opts:
                     except:
                         msg["Subject"] = f"{item['location']} {item['part']}"
                     msg.set_content(f"Resuming send for {item['location']} — part {item['part']}")
-                    # attach file by full path: find prepared summary row matching file
+                    # locate file path: DB file_path is primary (crash-safe), session_state is fallback
                     fname = item["file"]
-                    # locate file path in summary_rows
-                    ppath = None
-                    for r in st.session_state.get("summary_rows", []):
-                        if r["File"] == fname:
-                            ppath = r["Path"]
-                            break
+                    ppath = item.get("file_path", "")  # from DB — works after crash/restart
                     if not ppath or not os.path.exists(ppath):
-                        # mark failed in DB
-                        append_log(conn, {"location": item["location"], "recipients": item["recipients"], "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "files_in_part": item.get("files_in_part",0), "status": "Failed", "error": "Prepared file missing on server"})
+                        # Fallback: search session_state summary_rows (same-session only)
+                        for r in st.session_state.get("summary_rows", []):
+                            if r["File"] == fname:
+                                ppath = r["Path"]
+                                break
+                    if not ppath or not os.path.exists(ppath):
+                        append_log(conn, {"location": item["location"], "recipients": item["recipients"], "halltickets": item.get("halltickets",[]), "part": item["part"], "file": fname, "file_path": "", "files_in_part": item.get("files_in_part",0), "status": "Failed", "error": "Prepared file missing on server"})
                         continue
                     with open(ppath, "rb") as af:
                         msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(ppath))
@@ -740,14 +780,15 @@ with col_send:
                             with open(pinfo["path"], "rb") as af:
                                 msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(pinfo["path"]))
                             # Log BEFORE sending as Pending (so resume can pick it up if crash occurs)
-                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
+                            # file_path is stored so resume works even after server restart
+                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
                                 server.send_message(msg)
                                 # update log as Sent by inserting new row (keeps history)
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
                                 logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "FilesInPart": len(pinfo["files"]), "Status": "Sent"})
                             except Exception as e:
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
                                 logs.append({"Location": loc, "Recipients": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "FilesInPart": len(pinfo["files"]), "Status": f"Failed: {e}"})
                             sent_count += 1
                             rc += 1
