@@ -174,6 +174,10 @@ def human_bytes(n):
     return f"{n:.2f} PB"
 
 def create_chunked_zips_with_counts(file_paths, out_dir, base_name, max_bytes):
+    # Sanitize base_name — strip slashes and any path-unsafe characters
+    # e.g. "HISAR/Jind" -> "HISAR_Jind" so it can't create phantom subdirectories
+    base_name = re.sub(r'[^A-Za-z0-9_\-]', '_', base_name)
+
     # Ensure output directory exists (critical on Streamlit Cloud where paths may be read-only)
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -221,6 +225,7 @@ def create_chunked_zips_with_counts(file_paths, out_dir, base_name, max_bytes):
         # Current batch exceeds limit — flush all but the last file into a part
         last = current_files.pop()
         part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
+        os.makedirs(os.path.dirname(part_path), exist_ok=True)
         try:
             with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
                 for f in current_files:
@@ -243,6 +248,7 @@ def create_chunked_zips_with_counts(file_paths, out_dir, base_name, max_bytes):
     # Flush remaining files into the last part
     if current_files:
         part_path = os.path.join(out_dir, f"{base_name}_part{part_index}.zip")
+        os.makedirs(os.path.dirname(part_path), exist_ok=True)
         try:
             with zipfile.ZipFile(part_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
                 for f in current_files:
@@ -480,9 +486,10 @@ with prep_col1:
                 prepared[(loc, recip_str)] = []
                 prog.progress(int(i/total*100))
                 continue
-            out_dir = os.path.join(outroot, f"{loc}_{re.sub(r'[^A-Za-z0-9]', '_', recip_str)[:80]}")
+            safe_loc = re.sub(r'[^A-Za-z0-9]', '_', loc)[:60]
+            out_dir = os.path.join(outroot, f"{safe_loc}_{re.sub(r'[^A-Za-z0-9]', '_', recip_str)[:80]}")
             os.makedirs(out_dir, exist_ok=True)
-            parts = create_chunked_zips_with_counts(matched_paths, out_dir, base_name=loc.replace(" ", "_")[:60], max_bytes=max_bytes)
+            parts = create_chunked_zips_with_counts(matched_paths, out_dir, base_name=safe_loc, max_bytes=max_bytes)
             prepared[(loc, recip_str)] = parts
             total_files_in_group = sum(len(pinfo["files"]) for pinfo in parts)
             for idx_part, pinfo in enumerate(parts, start=1):
