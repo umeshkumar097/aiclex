@@ -373,12 +373,25 @@ for idx, row in df.iterrows():
     location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
     excel_halls.append(hall)
     matched_files = []
-    if hall:
-        hall_low = hall.lower()
+    if hall and hall not in ("", "nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
+        hall_low = hall.lower().strip()
         for fn, path in pdf_map.items():
             fn_low = fn.lower()
-            if fn_low.endswith(f"{hall_low}.pdf") or re.search(rf"[^0-9]{re.escape(hall_low)}[^0-9]", fn_low) or hall_low in fn_low:
+            # Strategy 1: filename ends exactly with the hallticket before .pdf
+            #   e.g. "admit-card-5070394.pdf" ends with "5070394.pdf"  ✓
+            ends_match = fn_low.endswith(f"{hall_low}.pdf")
+
+            # Strategy 2: hallticket appears as a COMPLETE standalone number in filename
+            #   Uses negative lookbehind (?<!\d) and negative lookahead (?!\d)
+            #   so "1" does NOT match "1036" but DOES match "-1-" or "_1." etc.
+            boundary_match = bool(re.search(
+                rf'(?<!\d){re.escape(hall_low)}(?!\d)',
+                fn_low
+            ))
+
+            if ends_match or boundary_match:
                 matched_files.append(fn)
+
     matched_files = sorted(set(matched_files))
     # Extract exam password from the first matched PDF
     password = ""
