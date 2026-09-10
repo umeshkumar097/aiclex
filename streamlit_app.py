@@ -426,6 +426,17 @@ try:
         df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
     else:
         df = pd.read_excel(uploaded_excel, dtype=str).fillna("")
+    # Deduplicate column names (e.g. 'Hallticket No', 'Hallticket No' → 'Hallticket No', 'Hallticket No_1')
+    seen = {}
+    new_cols = []
+    for col in df.columns:
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    df.columns = new_cols
 except Exception as e:
     st.error("Failed to read Excel: " + str(e))
     st.stop()
@@ -499,17 +510,18 @@ else:
         excel_halls.append(hall)
         matched_files = []
         if hall and hall not in ("", "nan", "SR NO", "HALLTICKET", "HALL TICKET", "HT NO"):
-            hall_low = hall.lower().strip()
+            # Strict: extract last 9-digit group from each filename and compare exactly
+            hall_digits = re.sub(r"\D", "", hall)
             for fn, path in pdf_map.items():
-                fn_low = fn.lower()
-                # Strategy 1: filename ends exactly with the hallticket before .pdf
-                ends_match = fn_low.endswith(f"{hall_low}.pdf")
-                # Strategy 2: hallticket appears as a COMPLETE standalone number in filename
-                boundary_match = bool(re.search(
-                    rf'(?<!\d){re.escape(hall_low)}(?!\d)',
-                    fn_low
-                ))
-                if ends_match or boundary_match:
+                stem = os.path.splitext(fn)[0]
+                all_groups = re.findall(r"\d+", stem)
+                # Prefer 9-digit groups; fallback to last group with >=6 digits
+                nine_digit = [g for g in all_groups if len(g) == 9]
+                fn_ht = nine_digit[-1] if nine_digit else (
+                    [g for g in all_groups if len(g) >= 6][-1] if any(len(g) >= 6 for g in all_groups)
+                    else (all_groups[-1] if all_groups else "")
+                )
+                if fn_ht and fn_ht == hall_digits:
                     matched_files.append(fn)
 
         matched_files = sorted(set(matched_files))
@@ -583,7 +595,7 @@ with st.expander("Reverse mapping  (PDF → Excel detect)", expanded=False):
 
 st.divider()
 
-# Grouping logic (unchanged)
+# Grouping: key = (location, recip_key, hall) — each hallticket isolated to its own bucket
 grouped = defaultdict(list)
 for idx, row in df.iterrows():
     hall = str(row[ht_col]).strip() if ht_col in row.index else str(row.iloc[0]).strip()
@@ -591,16 +603,25 @@ for idx, row in df.iterrows():
     location = str(row[loc_col]).strip() if loc_col in row.index else str(row.iloc[2]).strip()
     emails = [e.strip().lower() for e in re.split(r"[,;\n]+", raw_emails) if e.strip()]
     recip_key = tuple(sorted(emails))
-    grouped[(location, recip_key)].append(hall)
+    # KEY includes hallticket — prevents cross-mixing of PDFs
+    grouped[(location, recip_key, hall)].append(hall)
 st.session_state.grouped = grouped
 
 # Group summary — collapsed by default
 with st.expander("Group summary  (Location + Recipients)", expanded=False):
     summary_rows_grp = []
-    for (loc, recip_key), halls in grouped.items():
-        matched_count = sum(1 for ht in halls for fn in pdf_map if ht and ht in fn)
-        summary_rows_grp.append({"Location": loc, "Recipients": ", ".join(recip_key), "Tickets": len(halls), "MatchedPDFs": matched_count})
-    st.dataframe(pd.DataFrame(summary_rows_grp), use_container_width=True)
+    for (loc, recip_key, hall), halls in grouped.items():
+        matched_count = 1 if any(
+            re.sub(r"\D","",hall) == (
+                lambda groups: (
+                    [g for g in groups if len(g)==9][-1] if any(len(g)==9 for g in groups)
+                    else ([g for g in groups if len(g)>=6][-1] if any(len(g)>=6 for g in groups) else "")
+                )
+            )(re.findall(r"\d+", os.path.splitext(fn)[0]))
+            for fn in pdf_map
+        ) else 0
+        summary_rows_grp.append({"Location": loc, "Hallticket": hall, "Recipients": ", ".join(recip_key), "MatchedPDFs": matched_count})
+    st.dataframe(pd.DataFrame(summary_rows_grp))
 
 st.divider()
 
@@ -629,29 +650,41 @@ with prep_col1:
         groups = list(grouped.items())
         total = max(1, len(groups))
         prog = st.progress(0)
-        for i, ((loc, recip_key), halls) in enumerate(groups, start=1):
+        for i, ((loc, recip_key, hall), halls) in enumerate(groups, start=1):
             if st.session_state.cancel_requested:
                 status_ph.warning("Preparation cancelled.")
                 break
+            # Strict match: find PDF whose last 9-digit group == hall digits
+            hall_digits = re.sub(r"\D", "", hall)
             matched_paths = []
-            for ht in halls:
-                for fn, p in pdf_map.items():
-                    if ht and ht in fn:
-                        matched_paths.append(p)
+            for fn, p in pdf_map.items():
+                stem = os.path.splitext(fn)[0]
+                all_groups = re.findall(r"\d+", stem)
+                nine_digit = [g for g in all_groups if len(g) == 9]
+                fn_ht = nine_digit[-1] if nine_digit else (
+                    [g for g in all_groups if len(g) >= 6][-1] if any(len(g) >= 6 for g in all_groups)
+                    else (all_groups[-1] if all_groups else "")
+                )
+                if fn_ht and fn_ht == hall_digits:
+                    matched_paths.append(p)
+
             recip_str = ", ".join(recip_key)
             if not matched_paths:
-                prepared[(loc, recip_str)] = []
+                prepared[(loc, recip_str, hall)] = []
                 prog.progress(int(i/total*100))
                 continue
-            safe_loc = re.sub(r'[^A-Za-z0-9]', '_', loc)[:60]
-            out_dir = os.path.join(outroot, f"{safe_loc}_{re.sub(r'[^A-Za-z0-9]', '_', recip_str)[:80]}")
+            safe_loc  = re.sub(r'[^A-Za-z0-9]', '_', loc)[:30]
+            safe_hall = re.sub(r'[^A-Za-z0-9]', '_', hall)[:20]
+            base_name = f"{safe_loc}_{safe_hall}"   # e.g. Pune_803038629
+            out_dir = os.path.join(outroot, base_name)
             os.makedirs(out_dir, exist_ok=True)
-            parts = create_chunked_zips_with_counts(matched_paths, out_dir, base_name=safe_loc, max_bytes=max_bytes)
-            prepared[(loc, recip_str)] = parts
+            parts = create_chunked_zips_with_counts(matched_paths, out_dir, base_name=base_name, max_bytes=max_bytes)
+            prepared[(loc, recip_str, hall)] = parts
             total_files_in_group = sum(len(pinfo["files"]) for pinfo in parts)
             for idx_part, pinfo in enumerate(parts, start=1):
                 summary_rows.append({
                     "Location": loc,
+                    "Hallticket": hall,
                     "Recipients": recip_str,
                     "Part": f"{idx_part}/{len(parts)}",
                     "File": os.path.basename(pinfo["path"]),
@@ -899,12 +932,12 @@ with col_send:
                     server.login(sender_email, sender_pass)
                     RECONNECT_EVERY = 100
                     rc = 0
-                    for (loc, recip_str), parts in st.session_state.prepared.items():
+                    for (loc, recip_str, hall), parts in st.session_state.prepared.items():
                         if st.session_state.cancel_requested:
                             status_ph.warning("Bulk send cancelled.")
                             break
                         if not parts:
-                            logs.append({"Location": loc, "To": recip_str, "Part": "", "File": "", "Status": "No parts"})
+                            logs.append({"Location": loc, "Hallticket": hall, "To": recip_str, "Part": "", "File": "", "Status": "No parts"})
                             continue
                         for idx_part, pinfo in enumerate(parts, start=1):
                             if st.session_state.cancel_requested:
@@ -925,15 +958,15 @@ with col_send:
                             msg.set_content(body_txt)
                             with open(pinfo["path"], "rb") as af:
                                 msg.add_attachment(af.read(), maintype="application", subtype="zip", filename=os.path.basename(pinfo["path"]))
-                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
+                            append_log(conn, {"location": loc, "recipients": recip_str, "halltickets": [hall], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Pending", "error": ""})
                             try:
                                 server.send_message(msg)
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
-                                logs.append({"Location": loc, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [hall], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Sent", "error": ""})
+                                logs.append({"Location": loc, "Hallticket": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": "Sent"})
                             except Exception as e:
                                 failed_count += 1
-                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
-                                logs.append({"Location": loc, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
+                                append_log(conn, {"location": loc, "recipients": target_to, "halltickets": [hall], "part": f"{idx_part}/{len(parts)}", "file": os.path.basename(pinfo["path"]), "file_path": pinfo["path"], "files_in_part": len(pinfo["files"]), "status": "Failed", "error": str(e)})
+                                logs.append({"Location": loc, "Hallticket": hall, "To": target_to, "Part": f"{idx_part}/{len(parts)}", "File": os.path.basename(pinfo["path"]), "Status": f"Failed: {e}"})
                             sent_count += 1
                             rc += 1
                             _refresh_ui(sent_count, failed_count, total_parts, logs)
